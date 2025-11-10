@@ -19,7 +19,6 @@ TZ = "Europe/Amsterdam"
 # Surfdata ophalen
 # -----------------------
 def get_marine(lat, lon, days=2):
-    """Haalt golfhoogte en swellperiode op voor vandaag + 2 dagen"""
     base = "https://marine-api.open-meteo.com/v1/marine"
     params = {
         "latitude": lat,
@@ -41,7 +40,6 @@ def summarize_forecast(marine):
     periods = marine["hourly"]["swell_wave_period"]
     start_date = dt.date.fromisoformat(hours[0][:10])
     data = []
-
     for d in range(3):  # vandaag + 2 dagen
         date = start_date + dt.timedelta(days=d)
         sel = [i for i, t in enumerate(hours) if t.startswith(str(date))]
@@ -71,35 +69,28 @@ def ai_interpretation(spot_name, summary):
         "Gebruik een vriendelijke toon zoals een surfcoach."
     )
 
+    url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
     }
-
-    data = {
+    payload = {
         "model": "llama3-8b-8192",
         "messages": [
             {"role": "system", "content": "Je bent een surfcoach die kort en helder in het Nederlands schrijft."},
             {"role": "user", "content": prompt}
         ],
         "temperature": 0.7,
-        "max_tokens": 600,
-        "stream": False
+        "max_tokens": 600
     }
 
     try:
-        r = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers=headers,
-            json=data,
-            timeout=30
-        )
+        r = requests.request("POST", url, headers=headers, json=payload, timeout=30)
         r.raise_for_status()
         response = r.json()
         return response["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        # toon foutmelding in log voor debug
-        print("❌ API-fout:", getattr(e, "response", e))
+        print("❌ Foutmelding:", getattr(e, "response", e))
         return f"Geen forecast vandaag (fout: {e})"
 
 # -----------------------
