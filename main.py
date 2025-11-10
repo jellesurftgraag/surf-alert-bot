@@ -1,17 +1,19 @@
 import os, json, datetime as dt, requests, http.client
 import statistics as stats
-import locale
 
 # -----------------------
 # Instellingen
 # -----------------------
-locale.setlocale(locale.LC_TIME, "nl_NL.UTF-8")  # datum in het Nederlands
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 SPOT = {"name": "Scheveningen Pier", "lat": 52.109, "lon": 4.276, "bearing": 270}
 TZ = "Europe/Amsterdam"
+
+# Handmatige NL-datumlabels
+DAGEN = ["Maandag", "Dinsdag", "Woensdag", "Donderdag", "Vrijdag", "Zaterdag", "Zondag"]
+MAANDEN = ["jan", "feb", "mrt", "apr", "mei", "jun", "jul", "aug", "sep", "okt", "nov", "dec"]
 
 # -----------------------
 # Surf- en winddata ophalen
@@ -154,7 +156,8 @@ def ai_text(day):
 # -----------------------
 def build_message(spot, summary):
     today = summary[0]
-    label = today["date"].strftime("%A %d %b").capitalize()
+    d = today["date"]
+label = f"{DAGEN[d.weekday()]} {d.day} {MAANDEN[d.month-1]}"
     ai_part = ai_text(today)
 
     lines = [
