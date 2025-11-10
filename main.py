@@ -70,7 +70,7 @@ def summarize_forecast(marine, wind):
             continue
 
         avg_wave, avg_per, avg_wind, avg_dir = map(stats.mean, [wv, pr, ws, wd])
-        min_w, max_w = min(ws)*3.6, max(ws)*3.6
+        min_w, max_w = min(ws) * 3.6, max(ws) * 3.6
         min_h, max_h = min(wv), max(wv)
         min_t, max_t = min(pr), max(pr)
 
@@ -89,12 +89,12 @@ def summarize_forecast(marine, wind):
         # Vensters (3u)
         best_score, best_window = -999, "—"
         for h in range(8, 18):  # 08–20 => 3u blokken
-            sel = [i for i, t in enumerate(hrs) if t.startswith(str(date)) and h <= int(t[11:13]) < h+3]
+            sel = [i for i, t in enumerate(hrs) if t.startswith(str(date)) and h <= int(t[11:13]) < h + 3]
             if not sel:
                 continue
             H = stats.mean([waves[i] for i in sel])
             T = stats.mean([periods[i] for i in sel])
-            W = stats.mean([winds[i] for i in sel])*3.6
+            W = stats.mean([winds[i] for i in sel]) * 3.6
             raw = H**2 * T
             penalty = max(0, W - 30) * 0.8
             score = raw - penalty
@@ -102,9 +102,9 @@ def summarize_forecast(marine, wind):
                 best_score, best_window = score, f"{h:02d}–{h+3:02d}u"
 
         # Kleur
-        if avg_wave >= 1.1 and avg_per >= 7 and avg_wind*3.6 < 30:
+        if avg_wave >= 1.1 and avg_per >= 7 and avg_wind * 3.6 < 30:
             color = "🟢"
-        elif avg_wave >= 0.6 or avg_per >= 5 or avg_wind*3.6 <= 30:
+        elif avg_wave >= 0.6 or avg_per >= 5 or avg_wind * 3.6 <= 30:
             color = "🟠"
         else:
             color = "🔴"
@@ -117,7 +117,7 @@ def summarize_forecast(marine, wind):
             "best": best_window,
             "avg_wave": avg_wave,
             "avg_per": avg_per,
-            "avg_wind": avg_wind*3.6,
+            "avg_wind": avg_wind * 3.6,
             "energy": energy,
         })
     return data
@@ -164,7 +164,9 @@ def build_message(spot, summary):
     lines = []
     for i, day in enumerate(summary):
         label = day["date"].strftime("%A %d %b")
-        ai_part = ai_text(day)
+        # ✅ Fix: datum eerst omzetten naar tekst
+        day_serializable = {k: (v.isoformat() if isinstance(v, dt.date) else v) for k, v in day.items()}
+        ai_part = ai_text(day_serializable)
         lines.append(
             f"📅 {label}\n"
             f"{day['color']} {ai_part}\n"
