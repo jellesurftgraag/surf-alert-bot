@@ -3,7 +3,7 @@ import os, json, datetime as dt, requests
 # -----------------------
 # Instellingen
 # -----------------------
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -40,7 +40,6 @@ def summarize_forecast(marine):
     periods = marine["hourly"]["swell_wave_period"]
     start_date = dt.date.fromisoformat(hours[0][:10])
     data = []
-
     for d in range(3):
         date = start_date + dt.timedelta(days=d)
         sel = [i for i, t in enumerate(hours) if t.startswith(str(date))]
@@ -56,9 +55,10 @@ def summarize_forecast(marine):
     return data
 
 # -----------------------
-# Interpretatie via Gemini REST API (MakerSuite)
+# Interpretatie via Groq (Llama 3)
 # -----------------------
 def ai_interpretation(spot_name, summary):
+    """Laat Groq een korte surfanalyse maken in NL"""
     prompt = (
         f"Spot: {spot_name}\n"
         f"Data: {json.dumps(summary, ensure_ascii=False)}\n\n"
@@ -70,22 +70,21 @@ def ai_interpretation(spot_name, summary):
     )
 
     headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
-        "x-goog-api-key": GEMINI_API_KEY,
     }
 
-    data = {"contents": [{"parts": [{"text": prompt}]}]}
+    data = {
+        "model": "llama3-8b-8192",
+        "messages": [{"role": "user", "content": prompt}]
+    }
 
     try:
-        r = requests.post(
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent",
-            headers=headers,
-            json=data,
-            timeout=30
-        )
+        r = requests.post("https://api.groq.com/openai/v1/chat/completions",
+                          headers=headers, json=data, timeout=30)
         r.raise_for_status()
         response = r.json()
-        return response["candidates"][0]["content"]["parts"][0]["text"].strip()
+        return response["choices"][0]["message"]["content"].strip()
     except Exception as e:
         return f"Geen forecast vandaag (fout: {e})"
 
