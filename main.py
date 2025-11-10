@@ -11,6 +11,13 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SPOT = {"name": "Scheveningen Pier", "lat": 52.109, "lon": 4.276, "bearing": 270}
 TZ = "Europe/Amsterdam"
 
+# NL datumlabels
+WEEKDAYS_NL = ["maandag","dinsdag","woensdag","donderdag","vrijdag","zaterdag","zondag"]
+MONTHS_ABBR_NL = ["jan","feb","mrt","apr","mei","jun","jul","aug","sep","okt","nov","dec"]
+
+def format_date_nl(d: dt.date) -> str:
+    wd = WEEKDAYS_NL[d.weekday()].capitalize()
+    return f"{wd} {d.day:02d} {MONTHS_ABBR_NL[d.month-1]}"
 
 # -----------------------
 # Surf- en winddata ophalen
@@ -41,7 +48,6 @@ def get_marine(lat, lon, days=2):
     ).json()
 
     return marine, wind
-
 
 # -----------------------
 # Samenvatten + beste venster
@@ -101,16 +107,17 @@ def summarize_forecast(marine, wind):
             if score > best_score:
                 best_score, best_window = score, f"{h:02d}–{h+3:02d}u"
 
-        # Kleur
+        # Kleur (regels zoals afgesproken)
         if avg_wave >= 1.1 and avg_per >= 7 and avg_wind * 3.6 < 30:
             color = "🟢"
-        elif avg_wave >= 0.6 or avg_per >= 5 or avg_wind * 3.6 <= 30:
-            color = "🟠"
-        else:
+        elif avg_wave < 0.6 or avg_per < 5 or (wind_type == "onshore" and avg_wind * 3.6 > 30):
             color = "🔴"
+        else:
+            color = "🟠"
 
         data.append({
             "date": date,
+            "date_label": format_date_nl(date),
             "color": color,
             "wind": f"{min_w:.0f}–{max_w:.0f} km/h {wind_type}",
             "swell": f"{min_h:.1f}–{max_h:.1f} m — periode {min_t:.0f}–{max_t:.0f} s (~{energy:.1f} kJ/m)",
@@ -122,26 +129,29 @@ def summarize_forecast(marine, wind):
         })
     return data
 
-
 # -----------------------
-# AI-tekst (alleen titel + korte samenvatting)
+# AI-tekst (alleen titel + korte samenvatting, strikt JSON)
 # -----------------------
-def ai_text(day):
+def ai_text(day_dict):
+    # Verwacht: day_dict heeft alleen JSON-serializable types
+    day_json = json.dumps(day_dict, ensure_ascii=False)
     prompt = (
-        f"Data: {json.dumps(day, ensure_ascii=False)}\n\n"
-        "Geef één korte titelregel (max 6 woorden) en één zin samenvatting van de surfdag in het Nederlands, "
-        "in de stijl van een relaxte surfcoach. "
-        "Geen cijfers herhalen, geen tijden, geen windrichtingen, alleen sfeer en kwaliteit."
+        "Je krijgt dagdata als JSON onder 'data'. "
+        "Geef uitsluitend een JSON-object terug met precies deze velden: "
+        '{"title": "...", "summary": "..."}. '
+        "In het Nederlands, kort en natuurlijk. "
+        "Geen extra tekst, geen markdown, geen labels.\n\n"
+        f"data = {day_json}"
     )
 
     body = json.dumps({
         "model": "llama-3.1-8b-instant",
         "messages": [
-            {"role": "system", "content": "Je bent een Nederlandse surfcoach die kort en natuurlijk schrijft."},
+            {"role": "system", "content": "Schrijf beknopt als Nederlandse surfcoach. Antwoord ALLEEN met JSON met velden 'title' en 'summary'."},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.7,
-        "max_tokens": 100,
+        "max_tokens": 120,
     })
 
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
@@ -149,13 +159,23 @@ def ai_text(day):
     conn.request("POST", "/openai/v1/chat/completions", body, headers)
     res = conn.getresponse()
     data = res.read().decode()
-    if res.status != 200:
-        return "Geen titel beschikbaar."
-    try:
-        return json.loads(data)["choices"][0]["message"]["content"].strip()
-    except Exception:
-        return "Geen titel beschikbaar."
 
+    # Fallbacks bij fout of ongeldige JSON
+    if res.status != 200:
+        return ("Rustig met momenten", "Korte sessie in het beste venster; buiten die uren matig.")
+    try:
+        content = json.loads(data)["choices"][0]["message"]["content"].strip()
+        # soms levert een model ```json ... ```
+        if content.startswith("```"):
+            content = content.strip("` \n")
+            if content.lower().startswith("json"):
+                content = content[4:].lstrip()
+        obj = json.loads(content)
+        title = str(obj.get("title", "")).strip() or "Rustig met momenten"
+        summary = str(obj.get("summary", "")).strip() or "Korte sessie in het beste venster; buiten die uren matig."
+        return (title, summary)
+    except Exception:
+        return ("Rustig met momenten", "Korte sessie in het beste venster; buiten die uren matig.")
 
 # -----------------------
 # Bericht samenstellen
@@ -163,36 +183,37 @@ def ai_text(day):
 def build_message(spot, summary):
     lines = []
     for i, day in enumerate(summary):
-        label = day["date"].strftime("%A %d %b")
-        # ✅ Fix: datum eerst omzetten naar tekst
+        label = day["date_label"]
+        # datum JSON-safe maken voor de AI
         day_serializable = {k: (v.isoformat() if isinstance(v, dt.date) else v) for k, v in day.items()}
-        ai_part = ai_text(day_serializable)
+        title, summary_line = ai_text(day_serializable)
+
         lines.append(
             f"📅 {label}\n"
-            f"{day['color']} {ai_part}\n"
+            f"{day['color']} {title}\n"
             f"Wind: {day['wind']}\n"
             f"Swell: {day['swell']}\n"
-            f"👉 Beste moment: {day['best']}\n"
+            f"👉 Beste moment: {day['best']}\n\n"
+            f"🔍 Samenvatting: {summary_line}\n"
         )
 
-        # Korte piek waarschuwing
+        # Korte piek waarschuwing (behouden zoals afgesproken)
         if day["color"] != "🟢" and day["avg_wave"] < 0.8:
             lines.append("⚠️ Korte piek — buiten deze uren vrij rommelig.\n")
 
-    # Toekomstzinnen (dag +1 en +2)
+    # Toekomstzinnen (dag +1 en +2) — volledig regel-based
     if len(summary) > 1:
-        tomorrow = summary[1]
+        t = summary[1]
         lines.append(
-            f"Morgen: {tomorrow['best']} lijkt oké rond {tomorrow['avg_wave']:.1f} m / {tomorrow['avg_per']:.1f} s — kans op {tomorrow['color']}."
+            f"Morgen: {t['best']} lijkt oké rond {t['avg_wave']:.1f} m / {t['avg_per']:.1f} s — kans op {t['color']}."
         )
     if len(summary) > 2:
-        overmorgen = summary[2]
+        o = summary[2]
         lines.append(
-            f"Overmorgen: {overmorgen['avg_wave']:.1f} m / {overmorgen['avg_per']:.1f} s — waarschijnlijk {overmorgen['color']}."
+            f"Overmorgen: {o['avg_wave']:.1f} m / {o['avg_per']:.1f} s — waarschijnlijk {o['color']}."
         )
 
     return "\n".join(lines)
-
 
 # -----------------------
 # Telegram bericht sturen
@@ -201,7 +222,6 @@ def send_telegram_message(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
     requests.post(url, json=payload, timeout=20).raise_for_status()
-
 
 # -----------------------
 # Main
