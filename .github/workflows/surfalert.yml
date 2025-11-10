@@ -2,21 +2,24 @@ name: SurfAlert Bot
 
 on:
   schedule:
-    - cron: "0 8 * * *"
-    - cron: "0 7 * * *"
-  workflow_dispatch:
+    - cron: "0 8 * * *"  # 09:00 NL tijd in winter
+    - cron: "0 7 * * *"  # 09:00 NL tijd in zomer
+  workflow_dispatch:      # handmatig starten mogelijk via Actions-tab
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out code
+        uses: actions/checkout@v4
+
       - name: Set up Python and install dependencies
         run: |
           python -m venv .venv
           source .venv/bin/activate
           pip install --upgrade pip
           pip install requests
+
       - name: Run SurfAlert bot
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
