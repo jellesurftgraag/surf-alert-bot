@@ -1,4 +1,4 @@
-import os, json, datetime as dt, requests
+import os, json, datetime as dt, requests, http.client
 
 # -----------------------
 # Instellingen
@@ -7,12 +7,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SPOT = {
-    "name": "Scheveningen Pier",
-    "lat": 52.109,
-    "lon": 4.276,
-    "beach_bearing_deg": 270
-}
+SPOT = {"name": "Scheveningen Pier", "lat": 52.109, "lon": 4.276}
 TZ = "Europe/Amsterdam"
 
 # -----------------------
@@ -40,13 +35,13 @@ def summarize_forecast(marine):
     periods = marine["hourly"]["swell_wave_period"]
     start_date = dt.date.fromisoformat(hours[0][:10])
     data = []
-    for d in range(3):  # vandaag + 2 dagen
+    for d in range(3):
         date = start_date + dt.timedelta(days=d)
-        sel = [i for i, t in enumerate(hours) if t.startswith(str(date))]
-        if not sel:
+        idx = [i for i, t in enumerate(hours) if t.startswith(str(date))]
+        if not idx:
             continue
-        avg_wave = sum(waves[i] for i in sel) / len(sel)
-        avg_period = sum(periods[i] for i in sel if periods[i]) / len(sel)
+        avg_wave = sum(waves[i] for i in idx) / len(idx)
+        avg_period = sum(periods[i] for i in idx if periods[i]) / len(idx)
         data.append({
             "date": date.isoformat(),
             "wave_height_m": round(avg_wave, 2),
@@ -55,10 +50,10 @@ def summarize_forecast(marine):
     return data
 
 # -----------------------
-# Interpretatie via Groq (Llama 3)
+# Interpretatie via Groq (DEBUG-versie)
 # -----------------------
 def ai_interpretation(spot_name, summary):
-    """Laat Groq een korte surfanalyse maken in NL"""
+    """Diagnose van de API-call — toont exact wat er naar Groq gaat en wat terugkomt."""
     prompt = (
         f"Spot: {spot_name}\n"
         f"Data: {json.dumps(summary, ensure_ascii=False)}\n\n"
@@ -69,33 +64,39 @@ def ai_interpretation(spot_name, summary):
         "Gebruik een vriendelijke toon zoals een surfcoach."
     )
 
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    payload = {
-        "model": "llama3-8b",  # ✅ juiste modelnaam
+    body = json.dumps({
+        "model": "llama3-8b",
         "messages": [
             {"role": "system", "content": "Je bent een surfcoach die kort en helder in het Nederlands schrijft."},
             {"role": "user", "content": prompt}
         ],
         "temperature": 0.7,
         "max_tokens": 600
+    })
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
     }
 
+    print("➡️  Verbinding maken met Groq…")
+    print("🔑 GROQ key aanwezig:", bool(GROQ_API_KEY))
+    print("📦 Body-lengte:", len(body), "bytes")
+
+    conn = http.client.HTTPSConnection("api.groq.com")
+    conn.request("POST", "/openai/v1/chat/completions", body, headers)
+    res = conn.getresponse()
+    data = res.read().decode()
+    print("🌐 HTTP status:", res.status)
+    print("🧾 Response (eerste 300 tekens):", data[:300])
+
+    if res.status != 200:
+        return f"Geen forecast vandaag (HTTP {res.status})"
     try:
-        r = requests.post(url, headers=headers, json=payload, timeout=30)
-        r.raise_for_status()
-        response = r.json()
+        response = json.loads(data)
         return response["choices"][0]["message"]["content"].strip()
-    except requests.exceptions.RequestException as e:
-        if e.response is not None:
-            print("❌ API-fout:", e.response.text)
-        else:
-            print("❌ API-fout:", e)
-        return f"Geen forecast vandaag (fout: {e})"
+    except Exception as e:
+        return f"Geen forecast vandaag (parsefout: {e})"
 
 # -----------------------
 # Telegram bericht sturen
