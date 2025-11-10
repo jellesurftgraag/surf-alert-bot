@@ -1,5 +1,4 @@
 import os, json, datetime as dt, requests
-import google.generativeai as genai
 
 # -----------------------
 # Instellingen
@@ -15,9 +14,6 @@ SPOT = {
     "beach_bearing_deg": 270
 }
 TZ = "Europe/Amsterdam"
-
-# Configureer Gemini
-genai.configure(api_key=GEMINI_API_KEY)
 
 # -----------------------
 # Surfdata ophalen
@@ -61,10 +57,10 @@ def summarize_forecast(marine):
     return data
 
 # -----------------------
-# Interpretatie met Gemini
+# Interpretatie via Gemini REST API
 # -----------------------
 def ai_interpretation(spot_name, summary):
-    """Laat Gemini een korte surfanalyse maken in NL"""
+    """Laat Gemini een korte surfanalyse maken in NL via REST API"""
     prompt = (
         f"Spot: {spot_name}\n"
         f"Data: {json.dumps(summary, ensure_ascii=False)}\n\n"
@@ -75,9 +71,29 @@ def ai_interpretation(spot_name, summary):
         "Gebruik een vriendelijke toon zoals een surfcoach."
     )
 
-    model = genai.GenerativeModel("gemini-pro")
-    response = model.generate_content(prompt)
-    return response.text.strip()
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY,
+    }
+
+    data = {
+        "contents": [
+            {"parts": [{"text": prompt}]}
+        ]
+    }
+
+    try:
+        r = requests.post(
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent",
+            headers=headers,
+            json=data,
+            timeout=30
+        )
+        r.raise_for_status()
+        response = r.json()
+        return response["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except Exception as e:
+        return f"Geen forecast vandaag (fout: {e})"
 
 # -----------------------
 # Telegram bericht sturen
