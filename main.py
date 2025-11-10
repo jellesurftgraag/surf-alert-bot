@@ -157,7 +157,7 @@ def ai_text(day):
 def build_message(spot, summary):
     today = summary[0]
     d = today["date"]
-label = f"{DAGEN[d.weekday()]} {d.day} {MAANDEN[d.month-1]}"
+    label = f"{DAGEN[d.weekday()]} {d.day} {MAANDEN[d.month-1]}"
     ai_part = ai_text(today)
 
     lines = [
