@@ -1,0 +1,26 @@
+name: SurfAlert Bot
+
+on:
+  schedule:
+    - cron: "0 8 * * *"  # 09:00 NL tijd in winter
+    - cron: "0 7 * * *"  # 09:00 NL tijd in zomer
+  workflow_dispatch:      # handmatig starten mogelijk
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install requests openai
+      - name: Run surf bot
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          source .venv/bin/activate
+          python main.py
