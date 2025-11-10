@@ -1,12 +1,13 @@
 import os, json, datetime as dt, requests
-from openai import OpenAI
+import google.generativeai as genai
 
 # -----------------------
 # Instellingen
 # -----------------------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # jouw chat-ID (zie uitleg hieronder)
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
 SPOT = {
     "name": "Scheveningen Pier",
     "lat": 52.109,
@@ -15,12 +16,14 @@ SPOT = {
 }
 TZ = "Europe/Amsterdam"
 
-client_oa = OpenAI(api_key=OPENAI_API_KEY)
+# Configureer Gemini
+genai.configure(api_key=GEMINI_API_KEY)
 
 # -----------------------
-# Data ophalen
+# Surfdata ophalen
 # -----------------------
 def get_marine(lat, lon, days=2):
+    """Haalt golfhoogte en swellperiode op voor vandaag + 2 dagen"""
     base = "https://marine-api.open-meteo.com/v1/marine"
     params = {
         "latitude": lat,
@@ -34,16 +37,14 @@ def get_marine(lat, lon, days=2):
     return r.json()
 
 # -----------------------
-# Samenvatten en AI-analyse
+# Data samenvatten
 # -----------------------
 def summarize_forecast(marine):
     hours = marine["hourly"]["time"]
     waves = marine["hourly"]["wave_height"]
     periods = marine["hourly"]["swell_wave_period"]
-    now = dt.datetime.now().astimezone().isoformat()
-
-    data = []
     start_date = dt.date.fromisoformat(hours[0][:10])
+    data = []
 
     for d in range(3):  # vandaag + 2 dagen
         date = start_date + dt.timedelta(days=d)
@@ -59,21 +60,24 @@ def summarize_forecast(marine):
         })
     return data
 
+# -----------------------
+# Interpretatie met Gemini
+# -----------------------
 def ai_interpretation(spot_name, summary):
-    instructions = (
-        "Je bent een surfcoach. Schrijf kort en duidelijk in het Nederlands, "
-        "maximaal 750 tekens. Gebruik bullets. "
-        "Beoordeel voor elke dag hoe de surf is in Scheveningen, "
-        "voor beginners, intermediates en longboarders. "
-        "Zeg wanneer het waarschijnlijk het beste moment van de dag is (ochtend/middag/avond)."
+    """Laat Gemini een korte surfanalyse maken in NL"""
+    prompt = (
+        f"Spot: {spot_name}\n"
+        f"Data: {json.dumps(summary, ensure_ascii=False)}\n\n"
+        "Schrijf kort en duidelijk in het Nederlands (<750 tekens).\n"
+        "Gebruik bullets. Beschrijf per dag hoe de surf is voor beginners, "
+        "intermediates en longboarders. "
+        "Noem het beste moment (ochtend/middag/avond) op basis van golfhoogte en swellperiode. "
+        "Gebruik een vriendelijke toon zoals een surfcoach."
     )
-    user = f"Spot: {spot_name}. Data: {json.dumps(summary, ensure_ascii=False)}"
-    resp = client_oa.responses.create(
-        model="gpt-4o-mini",
-        instructions=instructions,
-        input=user
-    )
-    return resp.output_text.strip()
+
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    response = model.generate_content(prompt)
+    return response.text.strip()
 
 # -----------------------
 # Telegram bericht sturen
@@ -92,4 +96,4 @@ if __name__ == "__main__":
     summary = summarize_forecast(marine)
     message = ai_interpretation(SPOT["name"], summary)
     send_telegram_message(message)
-    print("Surfbericht verzonden!")
+    print("✅ Surfbericht verzonden!")
