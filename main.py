@@ -74,8 +74,9 @@ def ai_interpretation(spot_name, summary):
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
     }
+
     payload = {
-        "model": "llama3-8b-8192",
+        "model": "llama3-8b",  # ✅ juiste modelnaam
         "messages": [
             {"role": "system", "content": "Je bent een surfcoach die kort en helder in het Nederlands schrijft."},
             {"role": "user", "content": prompt}
@@ -85,12 +86,15 @@ def ai_interpretation(spot_name, summary):
     }
 
     try:
-        r = requests.request("POST", url, headers=headers, json=payload, timeout=30)
+        r = requests.post(url, headers=headers, json=payload, timeout=30)
         r.raise_for_status()
         response = r.json()
         return response["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        print("❌ Foutmelding:", getattr(e, "response", e))
+    except requests.exceptions.RequestException as e:
+        if e.response is not None:
+            print("❌ API-fout:", e.response.text)
+        else:
+            print("❌ API-fout:", e)
         return f"Geen forecast vandaag (fout: {e})"
 
 # -----------------------
