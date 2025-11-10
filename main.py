@@ -42,9 +42,19 @@ def summarize_forecast(marine):
         idx = [i for i, t in enumerate(hours) if t.startswith(str(date))]
         if not idx:
             continue
-        avg_wave = sum(waves[i] for i in idx) / len(idx)
-        avg_period = sum(periods[i] for i in idx if periods[i]) / len(idx)
-        avg_wind = sum(winds[i] for i in idx) / len(idx)
+
+        # Alleen geldige waardes gebruiken
+        wave_vals = [waves[i] for i in idx if waves[i] is not None]
+        period_vals = [periods[i] for i in idx if periods[i] is not None]
+        wind_vals = [winds[i] for i in idx if winds[i] is not None]
+
+        if not wave_vals or not period_vals or not wind_vals:
+            continue
+
+        avg_wave = sum(wave_vals) / len(wave_vals)
+        avg_period = sum(period_vals) / len(period_vals)
+        avg_wind = sum(wind_vals) / len(wind_vals)
+
         data.append({
             "date": date.isoformat(),
             "wave_height_m": round(avg_wave, 2),
@@ -57,7 +67,6 @@ def summarize_forecast(marine):
 # Interpretatie via Groq
 # -----------------------
 def ai_interpretation(spot_name, summary):
-    """Laat Groq een compacte surfupdate maken in jouw gewenste format."""
     prompt = (
         f"Spot: {spot_name}\n"
         f"Data: {json.dumps(summary, ensure_ascii=False)}\n\n"
