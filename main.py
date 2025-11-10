@@ -84,11 +84,11 @@ def ai_interpretation(spot_name, summary):
 
     try:
         r = requests.post(
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent",
-            headers=headers,
-            json=data,
-            timeout=30
-        )
+    "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent",
+    headers=headers,
+    json=data,
+    timeout=30
+)
         r.raise_for_status()
         response = r.json()
         return response["candidates"][0]["content"]["parts"][0]["text"].strip()
