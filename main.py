@@ -50,9 +50,9 @@ def get_marine(lat, lon, days=2):
 # -----------------------
 def summarize_forecast(marine, wind):
     hrs = marine["hourly"]["time"]
-    waves = [h * 1.4 if h else None for h in marine["hourly"]["wave_height"]]  # realistischer
-    periods = marine["hourly"]["swell_wave_period"]
-    winds = wind["hourly"]["windspeed_10m"]  # al in km/h
+    waves = [h * 1.4 if h else None for h in marine["hourly"]["wave_height"]]          # surfhoogte-correctie
+    periods = [(p + 0.5) if p else None for p in marine["hourly"]["swell_wave_period"]] # periode iets hoger
+    winds = wind["hourly"]["windspeed_10m"]  # km/u uit API
     dirs = wind["hourly"]["winddirection_10m"]
     start_date = dt.date.fromisoformat(hrs[0][:10])
 
@@ -76,6 +76,7 @@ def summarize_forecast(marine, wind):
         min_t, max_t = min(pr), max(pr)
         energy = 0.49 * avg_wave**2 * avg_per  # kJ/m
 
+        # Windrichting t.o.v. kustlijn
         def angle_diff(a, b): return abs((a - b + 180) % 360 - 180)
         if angle_diff(avg_dir, 270) <= 60:
             wind_type = "onshore"
@@ -84,6 +85,7 @@ def summarize_forecast(marine, wind):
         else:
             wind_type = "sideshore"
 
+        # Beste venster (3 uur)
         best_score, best_window = -999, "—"
         for h in range(8, 18, 3):
             sel = [i for i, t in enumerate(hrs) if t.startswith(str(date)) and h <= int(t[11:13]) < h + 3]
@@ -98,9 +100,23 @@ def summarize_forecast(marine, wind):
             if score > best_score:
                 best_score, best_window = score, f"{h:02d}–{h+3:02d}u"
 
-        if avg_wave >= 1.1 and avg_per >= 7 and avg_wind < 30 and energy >= 2.5:
+        # Kleurenlogica met windweging en richting
+        height_good = avg_wave >= 1.1
+        period_good = avg_per >= 7
+        wind_good = avg_wind <= 15
+        wind_moderate = 15 < avg_wind <= 25
+
+        dir_bonus = 0.0
+        if wind_type == "offshore":
+            dir_bonus += 0.5
+        if wind_type == "onshore" and avg_wind >= 20:
+            dir_bonus -= 0.5
+
+        score = (1 if height_good else 0) + (1 if period_good else 0) + (1 if wind_good else 0) + (0.5 if wind_moderate else 0) + dir_bonus
+
+        if score >= 2.5 and energy >= 2.5:
             color = "🟢"
-        elif avg_wave >= 0.6 or avg_per >= 5 or avg_wind <= 30:
+        elif score >= 1.0:
             color = "🟠"
         else:
             color = "🔴"
@@ -109,12 +125,13 @@ def summarize_forecast(marine, wind):
             "date": date,
             "color": color,
             "wind": f"{min_w:.0f}–{max_w:.0f} km/h {wind_type}",
-            "swell": f"{min_h:.1f}–{max_h:.1f} m — periode {min_t:.0f}–{max_t:.0f} s (~{energy:.1f} kJ/m)",
+            "swell": f"{min_h:.1f}–{max_h:.1f} m — periode {round(min_t)}–{round(max_t)} s (~{energy:.1f} kJ/m)",
             "best": best_window,
             "avg_wave": avg_wave,
             "avg_per": avg_per,
             "avg_wind": avg_wind,
             "energy": energy,
+            "variation": max_h - min_h
         })
     return data
 
@@ -125,7 +142,7 @@ def ai_text(day):
     prompt = (
         f"Data: {json.dumps({**day, 'date': str(day['date'])}, ensure_ascii=False)}\n\n"
         "Geef één korte, realistische titel (max 6 woorden) in het Nederlands over de surfdag. "
-        "Gebruik woorden als clean, rommelig, krachtig, matig, goed venster, enz. "
+        "Gebruik concrete surftermen zoals clean, rommelig, matig, krachtig, goed venster. "
         "Vermijd poëtische of weerkundige beelden. Geen cijfers of tijden."
     )
 
@@ -168,21 +185,21 @@ def build_message(spot, summary):
         f"👉 Beste moment: {today['best']}",
     ]
 
-    # Alleen tonen bij sterke variatie of harde wind
-    if (today["avg_wave"] < 0.8 or today["avg_wind"] > 25) and today["color"] != "🟢":
+    # Alleen tonen bij duidelijke variatie of harde wind
+    if today["variation"] > 0.4 or today["avg_wind"] > 25:
         lines.append("⚠️ Korte piek — buiten deze uren vrij rommelig.")
 
     lines.append("")  # lege regel
 
     if len(summary) > 1:
-        tomorrow = summary[1]
+        t = summary[1]
         lines.append(
-            f"Morgen: {tomorrow['best']} lijkt oké rond {tomorrow['avg_wave']:.1f} m / {tomorrow['avg_per']:.1f} s — kans op {tomorrow['color']}."
+            f"Morgen: {t['best']} lijkt oké rond {t['avg_wave']:.1f} m / {round(t['avg_per'])} s — kans op {t['color']}."
         )
     if len(summary) > 2:
-        overmorgen = summary[2]
+        o = summary[2]
         lines.append(
-            f"Overmorgen: {overmorgen['avg_wave']:.1f} m / {overmorgen['avg_per']:.1f} s — waarschijnlijk {overmorgen['color']}."
+            f"Overmorgen: {o['avg_wave']:.1f} m / {round(o['avg_per'])} s — waarschijnlijk {o['color']}."
         )
 
     return "\n".join(lines)
