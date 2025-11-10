@@ -122,7 +122,7 @@ def summarize_forecast(marine, wind):
 # -----------------------
 def ai_text(day):
     prompt = (
-        f"Data: {json.dumps(day, ensure_ascii=False)}\n\n"
+        f"Data: {json.dumps({**day, 'date': str(day['date'])}, ensure_ascii=False)}\n\n"
         "Geef één korte sfeervolle titel (max 6 woorden) over de surfdag in het Nederlands, "
         "zoals 'Clean sets bij laag tij' of 'Ruig en rommelig in de middag'. "
         "Laat cijfers en tijden weg, alleen toon en gevoel."
