@@ -43,6 +43,7 @@ def get_marine(lat, lon, days=2):
             "timezone": TZ,
             "hourly": "windspeed_10m,winddirection_10m",
             "forecast_days": days + 1,
+            "windspeed_unit": "kmh",  # expliciet km/h
         },
         timeout=30,
     ).json()
@@ -63,7 +64,6 @@ def summarize_forecast(marine, wind):
     data = []
     for d in range(3):
         date = start_date + dt.timedelta(days=d)
-        # Alleen uren 08–20
         idx = [i for i, t in enumerate(hrs) if t.startswith(str(date)) and 8 <= int(t[11:13]) < 20]
         if not idx:
             continue
@@ -76,7 +76,7 @@ def summarize_forecast(marine, wind):
             continue
 
         avg_wave, avg_per, avg_wind, avg_dir = map(stats.mean, [wv, pr, ws, wd])
-        min_w, max_w = min(ws) * 3.6, max(ws) * 3.6
+        min_w, max_w = min(ws), max(ws)
         min_h, max_h = min(wv), max(wv)
         min_t, max_t = min(pr), max(pr)
 
@@ -94,23 +94,23 @@ def summarize_forecast(marine, wind):
 
         # Vensters (3u)
         best_score, best_window = -999, "—"
-        for h in range(8, 18):  # 08–20 => 3u blokken
+        for h in range(8, 18):
             sel = [i for i, t in enumerate(hrs) if t.startswith(str(date)) and h <= int(t[11:13]) < h + 3]
             if not sel:
                 continue
             H = stats.mean([waves[i] for i in sel])
             T = stats.mean([periods[i] for i in sel])
-            W = stats.mean([winds[i] for i in sel]) * 3.6
+            W = stats.mean([winds[i] for i in sel])
             raw = H**2 * T
             penalty = max(0, W - 30) * 0.8
             score = raw - penalty
             if score > best_score:
                 best_score, best_window = score, f"{h:02d}–{h+3:02d}u"
 
-        # Kleur (regels zoals afgesproken)
-        if avg_wave >= 1.1 and avg_per >= 7 and avg_wind * 3.6 < 30:
+        # Kleurregels
+        if avg_wave >= 1.1 and avg_per >= 7 and avg_wind < 30:
             color = "🟢"
-        elif avg_wave < 0.6 or avg_per < 5 or (wind_type == "onshore" and avg_wind * 3.6 > 30):
+        elif avg_wave < 0.6 or avg_per < 5 or (wind_type == "onshore" and avg_wind > 30):
             color = "🔴"
         else:
             color = "🟠"
@@ -124,30 +124,30 @@ def summarize_forecast(marine, wind):
             "best": best_window,
             "avg_wave": avg_wave,
             "avg_per": avg_per,
-            "avg_wind": avg_wind * 3.6,
+            "avg_wind": avg_wind,
             "energy": energy,
         })
     return data
 
 # -----------------------
-# AI-tekst (alleen titel + korte samenvatting, strikt JSON)
+# AI-tekst (alleen titel + korte samenvatting)
 # -----------------------
 def ai_text(day_dict):
-    # Verwacht: day_dict heeft alleen JSON-serializable types
     day_json = json.dumps(day_dict, ensure_ascii=False)
     prompt = (
         "Je krijgt dagdata als JSON onder 'data'. "
         "Geef uitsluitend een JSON-object terug met precies deze velden: "
-        '{"title": "...", "summary": "..."}. '
-        "In het Nederlands, kort en natuurlijk. "
-        "Geen extra tekst, geen markdown, geen labels.\n\n"
+        '{"title": "...", "summary": "..."} '
+        "De titel moet klinken als een korte surfcoach-opmerking over de dag, zoals 'Clean sets in de ochtend' of 'Ruig en winderig'. "
+        "Gebruik geen datum of spotnaam. "
+        "Schrijf in het Nederlands, max 1 zin per veld.\n\n"
         f"data = {day_json}"
     )
 
     body = json.dumps({
         "model": "llama-3.1-8b-instant",
         "messages": [
-            {"role": "system", "content": "Schrijf beknopt als Nederlandse surfcoach. Antwoord ALLEEN met JSON met velden 'title' en 'summary'."},
+            {"role": "system", "content": "Je bent een Nederlandse surfcoach. Antwoord ALLEEN met JSON met 'title' en 'summary'."},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.7,
@@ -160,58 +160,54 @@ def ai_text(day_dict):
     res = conn.getresponse()
     data = res.read().decode()
 
-    # Fallbacks bij fout of ongeldige JSON
     if res.status != 200:
-        return ("Rustig met momenten", "Korte sessie in het beste venster; buiten die uren matig.")
+        return ("Rustige condities", "Geen AI-beschrijving vandaag.")
     try:
         content = json.loads(data)["choices"][0]["message"]["content"].strip()
-        # soms levert een model ```json ... ```
         if content.startswith("```"):
             content = content.strip("` \n")
             if content.lower().startswith("json"):
                 content = content[4:].lstrip()
         obj = json.loads(content)
-        title = str(obj.get("title", "")).strip() or "Rustig met momenten"
-        summary = str(obj.get("summary", "")).strip() or "Korte sessie in het beste venster; buiten die uren matig."
+        title = str(obj.get("title", "")).strip() or "Rustige condities"
+        summary = str(obj.get("summary", "")).strip() or "Geen AI-beschrijving vandaag."
         return (title, summary)
     except Exception:
-        return ("Rustig met momenten", "Korte sessie in het beste venster; buiten die uren matig.")
+        return ("Rustige condities", "Geen AI-beschrijving vandaag.")
 
 # -----------------------
 # Bericht samenstellen
 # -----------------------
 def build_message(spot, summary):
     lines = []
-    for i, day in enumerate(summary):
-        label = day["date_label"]
-        # datum JSON-safe maken voor de AI
-        day_serializable = {k: (v.isoformat() if isinstance(v, dt.date) else v) for k, v in day.items()}
-        title, summary_line = ai_text(day_serializable)
+    if not summary:
+        return "Geen forecast beschikbaar."
 
-        lines.append(
-            f"📅 {label}\n"
-            f"{day['color']} {title}\n"
-            f"Wind: {day['wind']}\n"
-            f"Swell: {day['swell']}\n"
-            f"👉 Beste moment: {day['best']}\n\n"
-            f"🔍 Samenvatting: {summary_line}\n"
-        )
+    # Alleen vandaag volledig
+    day0 = summary[0]
+    label = day0["date_label"]
+    day0_serializable = {k: (v.isoformat() if isinstance(v, dt.date) else v) for k, v in day0.items()}
+    title, summary_line = ai_text(day0_serializable)
 
-        # Korte piek waarschuwing (behouden zoals afgesproken)
-        if day["color"] != "🟢" and day["avg_wave"] < 0.8:
-            lines.append("⚠️ Korte piek — buiten deze uren vrij rommelig.\n")
+    lines.append(
+        f"📅 {label}\n"
+        f"{day0['color']} {title}\n"
+        f"Wind: {day0['wind']}\n"
+        f"Swell: {day0['swell']}\n"
+        f"👉 Beste moment: {day0['best']}\n\n"
+        f"🔍 Samenvatting: {summary_line}\n"
+    )
 
-    # Toekomstzinnen (dag +1 en +2) — volledig regel-based
+    if day0["color"] != "🟢" and day0["avg_wave"] < 0.8:
+        lines.append("⚠️ Korte piek — buiten deze uren vrij rommelig.\n")
+
+    # Korte afsluiters
     if len(summary) > 1:
         t = summary[1]
-        lines.append(
-            f"Morgen: {t['best']} lijkt oké rond {t['avg_wave']:.1f} m / {t['avg_per']:.1f} s — kans op {t['color']}."
-        )
+        lines.append(f"Morgen: {t['best']} lijkt oké rond {t['avg_wave']:.1f} m / {t['avg_per']:.1f} s — kans op {t['color']}.")
     if len(summary) > 2:
         o = summary[2]
-        lines.append(
-            f"Overmorgen: {o['avg_wave']:.1f} m / {o['avg_per']:.1f} s — waarschijnlijk {o['color']}."
-        )
+        lines.append(f"Overmorgen: {o['avg_wave']:.1f} m / {o['avg_per']:.1f} s — waarschijnlijk {o['color']}.")
 
     return "\n".join(lines)
 
