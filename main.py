@@ -19,7 +19,6 @@ TZ = "Europe/Amsterdam"
 # Surfdata ophalen
 # -----------------------
 def get_marine(lat, lon, days=2):
-    """Haalt golfhoogte en swellperiode op voor vandaag + 2 dagen"""
     base = "https://marine-api.open-meteo.com/v1/marine"
     params = {
         "latitude": lat,
@@ -42,7 +41,7 @@ def summarize_forecast(marine):
     start_date = dt.date.fromisoformat(hours[0][:10])
     data = []
 
-    for d in range(3):  # vandaag + 2 dagen
+    for d in range(3):
         date = start_date + dt.timedelta(days=d)
         sel = [i for i, t in enumerate(hours) if t.startswith(str(date))]
         if not sel:
@@ -57,10 +56,9 @@ def summarize_forecast(marine):
     return data
 
 # -----------------------
-# Interpretatie via Gemini REST API
+# Interpretatie via Gemini REST API (MakerSuite)
 # -----------------------
 def ai_interpretation(spot_name, summary):
-    """Laat Gemini een korte surfanalyse maken in NL via REST API"""
     prompt = (
         f"Spot: {spot_name}\n"
         f"Data: {json.dumps(summary, ensure_ascii=False)}\n\n"
@@ -76,19 +74,15 @@ def ai_interpretation(spot_name, summary):
         "x-goog-api-key": GEMINI_API_KEY,
     }
 
-    data = {
-        "contents": [
-            {"parts": [{"text": prompt}]}
-        ]
-    }
+    data = {"contents": [{"parts": [{"text": prompt}]}]}
 
     try:
         r = requests.post(
-    "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent",
-    headers=headers,
-    json=data,
-    timeout=30
-)
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent",
+            headers=headers,
+            json=data,
+            timeout=30
+        )
         r.raise_for_status()
         response = r.json()
         return response["candidates"][0]["content"]["parts"][0]["text"].strip()
