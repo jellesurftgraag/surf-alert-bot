@@ -65,7 +65,7 @@ def ai_interpretation(spot_name, summary):
     )
 
     body = json.dumps({
-    "model": "llama-3.2-8b-preview",
+    "model": "llama-3.1-8b-instant",
         "messages": [
             {"role": "system", "content": "Je bent een surfcoach die kort en helder in het Nederlands schrijft."},
             {"role": "user", "content": prompt}
