@@ -2,8 +2,7 @@ name: SurfAlert Bot
 
 on:
   schedule:
-    - cron: "0 8 * * *"  # 09:00 NL tijd in winter
-    - cron: "0 7 * * *"  # 09:00 NL tijd in zomer
+    - cron: "0 8 * * *"  # 09:00 NL tijd
   workflow_dispatch:
 
 jobs:
