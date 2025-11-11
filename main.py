@@ -144,18 +144,18 @@ def summarize_forecast(marine, wind):
 def ai_text(day):
     prompt = (
         f"Data: {json.dumps({**day, 'date': str(day['date'])}, ensure_ascii=False)}\n\n"
-        "Geef één korte, natuurlijke titel (max 6 woorden) over de surfdag in het Nederlands. "
-        "Gebruik termen als clean, rommelig, krachtig, matig, venster, swell. "
-        "Vermijd weerpraat of cijfers. Schrijf als een relaxte surfcoach, niet formeel."
+        "Je bent een relaxte Nederlandse surfcoach. Schrijf één korte, natuurlijke titel (max 6 woorden) "
+        "over de surfdag, met een menselijke toon. Gebruik termen als clean, rommelig, matig, krachtig, goed venster. "
+        "Geen cijfers, geen tijden, geen weerpraat. Zeg iets wat je tegen een surfer op het strand zou zeggen."
     )
 
     body = json.dumps({
         "model": "llama-3.1-8b-instant",
         "messages": [
-            {"role": "system", "content": "Je bent een Nederlandse surfcoach die realistische, korte beschrijvingen schrijft over surfcondities."},
+            {"role": "system", "content": "Je bent een surfcoach die korte, natuurlijke surfbeschrijvingen geeft in spreektaal."},
             {"role": "user", "content": prompt},
         ],
-        "temperature": 0.6,
+        "temperature": 0.7,
         "max_tokens": 60,
     })
 
@@ -191,10 +191,12 @@ def build_message(spot, summary):
 
     if len(summary) > 1:
         t = summary[1]
-        lines.append(f"Morgen: {t['best']} lijkt oké rond {t['avg_wave']:.1f} m / {round(t['avg_per'])} s — kans op {t['color']}.")
+        color_text = "goed" if t["color"] == "🟢" else "matig" if t["color"] == "🟠" else "slecht"
+        lines.append(f"Morgen: rond {t['best']} lijkt het {color_text}, met ~{t['avg_wave']:.1f} m en {round(t['avg_per'])} s swell.")
     if len(summary) > 2:
         o = summary[2]
-        lines.append(f"Overmorgen: {o['avg_wave']:.1f} m / {round(o['avg_per'])} s — waarschijnlijk {o['color']}.")
+        color_text = "goed" if o["color"] == "🟢" else "matig" if o["color"] == "🟠" else "slecht"
+        lines.append(f"Overmorgen: waarschijnlijk {color_text}, met ~{o['avg_wave']:.1f} m en {round(o['avg_per'])} s swell.")
 
     return "\n".join(lines)
 
@@ -212,6 +214,9 @@ def send_telegram_message(text):
 if __name__ == "__main__":
     marine, wind = get_marine(SPOT["lat"], SPOT["lon"], days=2)
     summary = summarize_forecast(marine, wind)
-    message = build_message(SPOT["name"], summary)
-    send_telegram_message(message)
+    if not summary:
+        send_telegram_message("Geen surfdata beschikbaar vandaag 🌊")
+    else:
+        message = build_message(SPOT["name"], summary)
+        send_telegram_message(message)
     print("✅ Surfbericht verzonden!")
