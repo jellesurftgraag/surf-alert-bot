@@ -135,28 +135,67 @@ def summarize_forecast(marine, wind):
             "avg_per": avg_per,
             "avg_wind": avg_wind,
             "energy": energy,
+            "wind_type": wind_type,
         })
     return data
 
 # -----------------------
-# AI-tekst (alleen vandaag)
+# AI-tekst (gekoppeld aan kleur + data)
 # -----------------------
 def ai_text(day):
-    prompt = (
-        f"Data: {json.dumps({**day, 'date': str(day['date'])}, ensure_ascii=False)}\n\n"
-        "Je bent een relaxte Nederlandse surfcoach. Schrijf één korte, natuurlijke titel (max 6 woorden) "
-        "over de surfdag, met een menselijke toon. Gebruik termen als clean, rommelig, matig, krachtig, goed venster. "
-        "Geen cijfers, geen tijden, geen weerpraat. Zeg iets wat je tegen een surfer op het strand zou zeggen."
-    )
+    """
+    Genereert een korte, natuurlijke surfbeschrijving op basis van de berekende data.
+    Variaties in toon (informeel/nuchter), maar altijd in lijn met de kleurbeoordeling.
+    """
+
+    kleur = day["color"]
+    wave = round(day["avg_wave"], 1)
+    period = round(day["avg_per"])
+    wind = round(day["avg_wind"])
+    dir = day.get("wind_type", "onbekend")
+    energy = round(day["energy"], 1)
+
+    prompt = f"""
+Je bent een ervaren Nederlandse surfcoach die korte, nuchtere updates schrijft over de surf aan de Noordzee (Scheveningen).
+Je krijgt de meetdata en een kleurbeoordeling van een algoritme. Schrijf op basis daarvan één korte, natuurlijke zin (max 12 woorden) over hoe de surfdag aanvoelt.
+
+### Data
+- Golfhoogte: {wave} m
+- Periode: {period} s
+- Windsnelheid: {wind} km/u
+- Windrichting: {dir}
+- Energie: {energy} kJ/m
+- Eindkleur: {kleur}
+
+### Richtlijnen
+- Gebruik de kleur als sentiment:
+  - 🟢 = goed, clean, krachtig, mooi venster, surfbaar
+  - 🟠 = oké, surfbaar maar rommelig of matig
+  - 🔴 = slecht, weinig kracht, korte swell of te veel wind
+- Gebruik een natuurlijke spreekstijl — alsof je een maat een appje stuurt over het surfweer.
+- Je mag subtiel variëren in toon: soms nuchter (“prima te doen”), soms iets beeldender (“rommelig maar surfbaar”), maar nooit overdreven of poëtisch.
+- Gebruik woorden als clean, rommelig, blown out, prima, matig, krachtig, klein, deining.
+- Geen cijfers of tijden. Geen opsommingen.
+- Maximaal één zin.
+- Geef alleen de zin, zonder uitleg of aanhalingstekens.
+
+### Voorbeelden
+- 🔴: Kleine rommelige golven met harde wind.
+- 🔴: Weinig kracht, korte onrustige swell.
+- 🟠: Surfbaar venster, maar wat windgevoelig.
+- 🟠: Aardig te doen, maar niet super clean.
+- 🟢: Clean sets en een prima ochtend.
+- 🟢: Mooi clean venster met krachtige sets.
+"""
 
     body = json.dumps({
         "model": "llama-3.1-8b-instant",
         "messages": [
-            {"role": "system", "content": "Je bent een surfcoach die korte, natuurlijke surfbeschrijvingen geeft in spreektaal."},
-            {"role": "user", "content": prompt},
+            {"role": "system", "content": "Je schrijft korte, realistische surfupdates in het Nederlands, met natuurlijke spreektaal."},
+            {"role": "user", "content": prompt.strip()},
         ],
         "temperature": 0.7,
-        "max_tokens": 60,
+        "max_tokens": 50,
     })
 
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
@@ -164,6 +203,7 @@ def ai_text(day):
     conn.request("POST", "/openai/v1/chat/completions", body, headers)
     res = conn.getresponse()
     data = res.read().decode()
+
     if res.status != 200:
         return "Geen titel beschikbaar."
     try:
