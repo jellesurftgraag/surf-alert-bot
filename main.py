@@ -278,7 +278,7 @@ def summarize_forecast(marine, wind):
     return data
 
 # -----------------------
-# Best-moment tekst uit clusters
+# Best-moment tekst uit clusters (exacte tijden)
 # -----------------------
 def best_moment_text(day):
     clusters = day.get("clusters") or []
@@ -298,6 +298,43 @@ def best_moment_text(day):
         return moments[0]
     else:
         return " en ".join(moments)
+
+# -----------------------
+# Natuurlijke venstertekst voor morgen/overmorgen
+# -----------------------
+def natural_window_phrase(day):
+    """
+    Maakt van de beste cluster een natuurlijke omschrijving:
+    - ≥ 9 uur: 'vrijwel de hele dag'
+    - 6–8 uur: 'een groot deel van de dag (HH–HHu)'
+    - 3–5 uur: 'tussen HH–HHu'
+    - 1–2 uur: 'even een venster rond HH–HHu'
+    - geen clusters: 'geen duidelijk goed venster'
+    """
+    clusters = day.get("clusters") or []
+    if not clusters:
+        return "geen duidelijk goed venster"
+
+    clusters_sorted = sorted(clusters, key=lambda c: c["score"], reverse=True)
+    top = clusters_sorted[0]
+    length = top["end"] - top["start"]
+
+    if length >= 9:
+        phrase = "vrijwel de hele dag"
+    elif length >= 6:
+        phrase = f"een groot deel van de dag ({top['start']:02d}–{top['end']:02d}u)"
+    elif length >= 3:
+        phrase = f"tussen {top['start']:02d}–{top['end']:02d}u"
+    else:
+        phrase = f"even een venster rond {top['start']:02d}–{top['end']:02d}u"
+
+    # Eventueel tweede duidelijk goed venster noemen
+    if len(clusters_sorted) > 1:
+        second = clusters_sorted[1]
+        if second["score"] >= 0.85 * top["score"]:
+            phrase += f" en nog een venster rond {second['start']:02d}–{second['end']:02d}u"
+
+    return phrase
 
 # -----------------------
 # AI-tekst (gekoppeld aan kleur + labels)
@@ -454,7 +491,6 @@ def build_message(spot, summary):
     if "Geen duidelijk goed moment" in best_today:
         lines.append(f"👉 Beste moment: geen echt duidelijk venster vandaag.")
     else:
-        # enkelvoud/meervoud een beetje slim
         if " en " in best_today:
             lines.append(f"👉 Beste momenten: {best_today}")
         else:
@@ -462,21 +498,34 @@ def build_message(spot, summary):
 
     lines.append("")
 
-    # Morgen / overmorgen
+    # Morgen / overmorgen met natuurlijke venstertaal
     if len(summary) > 1:
         t = summary[1]
-        best_t = best_moment_text(t)
-        lines.append(
-            f"{color_square(t['color'])} Morgen: rond {best_t} lijkt het {color_word(t['color'])}, "
-            f"met ~{t['avg_wave']:.1f} m en {round(t['avg_per'])} s swell."
-        )
+        phrase_t = natural_window_phrase(t)
+        if "geen duidelijk goed venster" in phrase_t:
+            lines.append(
+                f"{color_square(t['color'])} Morgen: {phrase_t}, "
+                f"met ~{t['avg_wave']:.1f} m en {round(t['avg_per'])} s swell."
+            )
+        else:
+            lines.append(
+                f"{color_square(t['color'])} Morgen: {phrase_t} {color_word(t['color'])} surf, "
+                f"met ~{t['avg_wave']:.1f} m en {round(t['avg_per'])} s swell."
+            )
+
     if len(summary) > 2:
         o = summary[2]
-        best_o = best_moment_text(o)
-        lines.append(
-            f"{color_square(o['color'])} Overmorgen: rond {best_o} waarschijnlijk {color_word(o['color'])}, "
-            f"met ~{o['avg_wave']:.1f} m en {round(o['avg_per'])} s swell."
-        )
+        phrase_o = natural_window_phrase(o)
+        if "geen duidelijk goed venster" in phrase_o:
+            lines.append(
+                f"{color_square(o['color'])} Overmorgen: {phrase_o}, "
+                f"met ~{o['avg_wave']:.1f} m en {round(o['avg_per'])} s swell."
+            )
+        else:
+            lines.append(
+                f"{color_square(o['color'])} Overmorgen: {phrase_o} {color_word(o['color'])} surf, "
+                f"met ~{o['avg_wave']:.1f} m en {round(o['avg_per'])} s swell."
+            )
 
     return "\n".join(lines)
 
