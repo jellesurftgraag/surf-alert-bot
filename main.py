@@ -76,7 +76,7 @@ def score_for_conditions(H, T, W, dir_type):
     return score
 
 # -----------------------
-# Samenvatten + uur-scores + clusters
+# Samenvatten + uur-scores + clusters + dagdelen
 # -----------------------
 def summarize_forecast(marine, wind):
     hrs = marine["hourly"]["time"]
@@ -86,6 +86,9 @@ def summarize_forecast(marine, wind):
     winds = wind["hourly"]["windspeed_10m"]   # km/u
     dirs = wind["hourly"]["winddirection_10m"]
     start_date = dt.date.fromisoformat(hrs[0][:10])
+
+    def angle_diff(a, b):
+        return abs((a - b + 180) % 360 - 180)
 
     data = []
     for d in range(3):
@@ -109,9 +112,6 @@ def summarize_forecast(marine, wind):
         energy = 0.49 * avg_wave**2 * avg_per  # kJ/m
 
         # Windrichting t.o.v. kustlijn (voor dag-type)
-        def angle_diff(a, b):
-            return abs((a - b + 180) % 360 - 180)
-
         if angle_diff(avg_dir, 270) <= 60:
             day_wind_type = "onshore"
         elif angle_diff(avg_dir, 90) <= 60:
@@ -124,6 +124,7 @@ def summarize_forecast(marine, wind):
 
         # Uur-scores + lokale windrichtingen
         hourly_scores = {}
+        hourly_meta = {}  # voor dagdelen (hoogte/periode/wind/dir per uur)
         for h in range(8, 20):
             h_idx = [i for i, t in enumerate(hrs) if t.startswith(str(date)) and int(t[11:13]) == h]
             if not h_idx:
@@ -139,7 +140,6 @@ def summarize_forecast(marine, wind):
             h_wind = stats.mean(Wv)
             h_dir = stats.mean(Dv)
 
-            # richting per uur
             if angle_diff(h_dir, 270) <= 60:
                 h_type = "onshore"
             elif angle_diff(h_dir, 90) <= 60:
@@ -149,6 +149,13 @@ def summarize_forecast(marine, wind):
 
             s = score_for_conditions(h_wave, h_per, h_wind, h_type)
             hourly_scores[h] = s
+            hourly_meta[h] = {
+                "wave": h_wave,
+                "period": h_per,
+                "wind": h_wind,
+                "dir": h_dir,
+                "wind_type": h_type,
+            }
 
         # drempel voor "goed" uur (combinatie absolute + relatieve drempel)
         if hourly_scores:
@@ -191,15 +198,71 @@ def summarize_forecast(marine, wind):
 
         # Kleur op basis van beste cluster + energie
         if best_cluster_score >= 2.3 and energy >= 2.5:
-            color = "🟢"
+            day_color = "🟢"
         elif best_cluster_score >= 1.0:
-            color = "🟠"
+            day_color = "🟠"
         else:
-            color = "🔴"
+            day_color = "🔴"
+
+        # -----------------------
+        # Dagdelen (ochtend/middag/avond)
+        # -----------------------
+        dayparts_def = {
+            "Ochtend": (8, 12),
+            "Middag": (12, 16),
+            "Avond": (16, 20),
+        }
+
+        dayparts = {}
+        for naam, (h_start, h_end) in dayparts_def.items():
+            part_hours = [h for h in range(h_start, h_end) if h in hourly_meta]
+            if not part_hours:
+                continue
+
+            pwaves = [hourly_meta[h]["wave"] for h in part_hours]
+            pper = [hourly_meta[h]["period"] for h in part_hours]
+            pwinds = [hourly_meta[h]["wind"] for h in part_hours]
+            pdirs = [hourly_meta[h]["dir"] for h in part_hours]
+            if not (pwaves and pper and pwinds and pdirs):
+                continue
+
+            p_wave_avg = stats.mean(pwaves)
+            p_per_avg = stats.mean(pper)
+            p_wind_avg = stats.mean(pwinds)
+            p_dir_avg = stats.mean(pdirs)
+
+            # lokale wind-type
+            if angle_diff(p_dir_avg, 270) <= 60:
+                p_type = "onshore"
+            elif angle_diff(p_dir_avg, 90) <= 60:
+                p_type = "offshore"
+            else:
+                p_type = "sideshore"
+
+            p_score = score_for_conditions(p_wave_avg, p_per_avg, p_wind_avg, p_type)
+            p_energy = 0.49 * p_wave_avg**2 * p_per_avg
+
+            # kleur per dagdeel
+            if p_score >= 2.3 and p_energy >= 2.5:
+                p_color = "🟢"
+            elif p_score >= 1.0:
+                p_color = "🟠"
+            else:
+                p_color = "🔴"
+
+            dayparts[naam] = {
+                "color": p_color,
+                "h_min": min(pwaves),
+                "h_max": max(pwaves),
+                "t_min": min(pper),
+                "t_max": max(pper),
+                "wind_avg": p_wind_avg,
+                "wind_type": p_type,
+            }
 
         data.append({
             "date": date,
-            "color": color,
+            "color": day_color,
             "wind": f"{min_w:.0f}–{max_w:.0f} km/h {day_wind_type}",
             "swell": f"{min_h:.1f}–{max_h:.1f} m — periode {round(min_t)}–{round(max_t)} s (~{energy:.1f} kJ/m)",
             "avg_wave": avg_wave,
@@ -210,6 +273,7 @@ def summarize_forecast(marine, wind):
             "day_score": day_score,
             "best_cluster_score": best_cluster_score,
             "clusters": clusters,
+            "dayparts": dayparts,
         })
     return data
 
@@ -221,12 +285,10 @@ def best_moment_text(day):
     if not clusters:
         return "Geen duidelijk goed moment vandaag."
 
-    # Sorteer clusters op score (hoogste eerst)
     clusters_sorted = sorted(clusters, key=lambda c: c["score"], reverse=True)
     top = clusters_sorted[0]
     moments = [f"{top['start']:02d}–{top['end']:02d}u"]
 
-    # eventueel tweede goede cluster als die bijna zo goed is
     if len(clusters_sorted) > 1:
         second = clusters_sorted[1]
         if second["score"] >= 0.85 * top["score"]:
@@ -306,14 +368,6 @@ Je krijgt een kleurbeoordeling en een paar labels over hoogte, periode en wind. 
 - Geen cijfers, geen tijden, geen opsommingen.
 - Maximaal één zin.
 - Geef alleen de zin, zonder uitleg of aanhalingstekens.
-
-### Voorbeelden
-- 🔴: Kleine rommelige golven met weinig kracht vandaag.
-- 🔴: Korte onrustige swell met harde onshore wind.
-- 🟠: Surfbaar venster, maar wat rommelige lijnen en windgevoelig.
-- 🟠: Aardig te doen, maar niet super clean of krachtig.
-- 🟢: Clean lijntje met prima hoogte en lange sets.
-- 🟢: Mooie krachtige deining, zeker de moeite waard.
 """
 
     body = json.dumps({
@@ -343,6 +397,25 @@ Je krijgt een kleurbeoordeling en een paar labels over hoogte, periode en wind. 
         return "Geen titel beschikbaar."
 
 # -----------------------
+# Kleine helpers voor kleurwoorden / vierkantjes
+# -----------------------
+def color_word(c):
+    if c == "🟢":
+        return "goed"
+    if c == "🟠":
+        return "oké"
+    return "slecht"
+
+def color_square(c):
+    if c == "🟢":
+        return "🟩"
+    if c == "🟠":
+        return "🟧"
+    if c == "🔴":
+        return "🟥"
+    return c
+
+# -----------------------
 # Bericht samenstellen
 # -----------------------
 def build_message(spot, summary):
@@ -352,34 +425,56 @@ def build_message(spot, summary):
     ai_part = ai_text(today)
     best_today = best_moment_text(today)
 
-    lines = [
-        f"📅 {label}",
-        f"{today['color']} {ai_part}",
-        f"Wind: {today['wind']}",
-        f"Swell: {today['swell']}",
-        f"👉 Beste moment: {best_today}",
-        "",
-    ]
+    lines = []
+    # Header met vierkantje + AI-conclusie
+    lines.append(f"📅 {label}")
+    lines.append(f"{color_square(today['color'])} {ai_part}")
+    lines.append("")
 
-    def color_word(c):
-        if c == "🟢":
-            return "goed"
-        if c == "🟠":
-            return "oké"
-        return "slecht"
+    # Dagdelen (als we ze hebben)
+    dayparts = today.get("dayparts") or {}
+    for naam in ["Ochtend", "Middag", "Avond"]:
+        part = dayparts.get(naam)
+        if not part:
+            continue
+        c = part["color"]
+        h_min = part["h_min"]
+        h_max = part["h_max"]
+        t_min = part["t_min"]
+        t_max = part["t_max"]
+        w_avg = part["wind_avg"]
+        w_type = part["wind_type"]
 
+        lines.append(
+            f"{c} {naam}: {h_min:.1f}–{h_max:.1f} m / {round(t_min)}–{round(t_max)} s — ~{round(w_avg):.0f} km/u {w_type}"
+        )
+
+    lines.append("")
+    # Beste momenten
+    if "Geen duidelijk goed moment" in best_today:
+        lines.append(f"👉 Beste moment: geen echt duidelijk venster vandaag.")
+    else:
+        # enkelvoud/meervoud een beetje slim
+        if " en " in best_today:
+            lines.append(f"👉 Beste momenten: {best_today}")
+        else:
+            lines.append(f"👉 Beste moment: {best_today}")
+
+    lines.append("")
+
+    # Morgen / overmorgen
     if len(summary) > 1:
         t = summary[1]
         best_t = best_moment_text(t)
         lines.append(
-            f"{t['color']} Morgen: rond {best_t} lijkt het {color_word(t['color'])}, "
+            f"{color_square(t['color'])} Morgen: rond {best_t} lijkt het {color_word(t['color'])}, "
             f"met ~{t['avg_wave']:.1f} m en {round(t['avg_per'])} s swell."
         )
     if len(summary) > 2:
         o = summary[2]
         best_o = best_moment_text(o)
         lines.append(
-            f"{o['color']} Overmorgen: rond {best_o} waarschijnlijk {color_word(o['color'])}, "
+            f"{color_square(o['color'])} Overmorgen: rond {best_o} waarschijnlijk {color_word(o['color'])}, "
             f"met ~{o['avg_wave']:.1f} m en {round(o['avg_per'])} s swell."
         )
 
