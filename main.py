@@ -45,34 +45,78 @@ def get_marine(lat, lon, days=2):
 # Helper: conditie-score
 # -----------------------
 def score_for_conditions(H, T, W, dir_type):
-    """Geeft een surf-score voor één set condities."""
+    """
+    Geeft een surf-score voor één set condities.
+    Belangrijkste principes:
+    - Zeer kleine hoogte (< 0.4 m) is vrijwel nooit surfbaar.
+    - Periode mag kleine hoogte niet 'redden'.
+    - Harde onshore wind wordt stevig afgestraft.
+    """
+    if H is None or T is None or W is None:
+        return 0.0
+
     score = 0.0
-    # Hoogte
-    if H >= 1.1:
-        score += 1.0
-    elif 0.8 <= H < 1.1:
-        score += 0.5
+
+    # Hoogte (basis)
+    if H < 0.4:
+        height_score = 0.0
+    elif 0.4 <= H < 0.6:
+        height_score = 0.3
     elif 0.6 <= H < 0.8:
-        score += 0.3
-    # Periode
-    if T >= 7:
+        height_score = 0.6
+    elif 0.8 <= H < 1.2:
+        height_score = 1.0
+    else:
+        height_score = 1.2
+    score += height_score
+
+    # Periode (maar niet alles compenseren)
+    if T >= 8:
         score += 1.0
+    elif 7 <= T < 8:
+        score += 0.8
     elif 6 <= T < 7:
         score += 0.5
     elif 5 <= T < 6:
         score += 0.3
-    # Windkracht
-    if W <= 15:
+    else:
+        score += 0.0  # echt korte periodes helpen niet
+
+    # Windkracht (minder belonen bij veel wind)
+    if W <= 10:
         score += 1.0
-    elif 16 <= W <= 25:
-        score += 0.6
-    elif 26 <= W <= 30:
+    elif 10 < W <= 18:
+        score += 0.7
+    elif 18 < W <= 26:
         score += 0.3
-    # Windrichting
+    else:
+        score += 0.0
+
+    # Windrichting / type
     if dir_type == "offshore":
-        score += 1.0  # offshore extra belonen
-    elif dir_type == "onshore" and W > 20:
-        score -= 0.3
+        score += 0.4
+        # maar bij echt harde offshore (> 25 km/u) niet té positief
+        if W > 25:
+            score -= 0.2
+    elif dir_type == "onshore":
+        if W > 28:
+            score -= 0.8
+        elif W > 20:
+            score -= 0.5
+        else:
+            score -= 0.2
+    else:  # sideshore
+        if W > 28:
+            score -= 0.2
+
+    # Hardere caps op te kleine hoogte:
+    # - < 0.4 m: nooit boven 0.5 → praktisch altijd rood
+    # - 0.4–0.6 m: maximaal 1.0 → hooguit oranje
+    if H < 0.4:
+        score = min(score, 0.5)
+    elif H < 0.6:
+        score = min(score, 1.0)
+
     return score
 
 # -----------------------
@@ -347,8 +391,10 @@ def ai_text(day):
     dir_type = day.get("wind_type", "onbekend")
     energy = round(day["energy"], 1)
 
-    # Labels
-    if wave < 0.6:
+    # Labels voor extra context
+    if wave < 0.4:
+        wave_quality = "heel klein"
+    elif wave < 0.6:
         wave_quality = "klein"
     elif wave < 0.9:
         wave_quality = "oké"
@@ -366,9 +412,11 @@ def ai_text(day):
     else:
         period_quality = "mooi lang"
 
-    if wind > 30:
+    if wind > 35:
+        wind_quality = "heel hard"
+    elif wind > 25:
         wind_quality = "hard"
-    elif wind > 20:
+    elif wind > 18:
         wind_quality = "matig"
     elif wind > 12:
         wind_quality = "prima"
@@ -385,7 +433,7 @@ def ai_text(day):
     prompt = f"""
 Je bent een ervaren Nederlandse surfcoach die korte, nuchtere updates schrijft over de surf aan de Noordzee (Scheveningen).
 Je krijgt een kleurbeoordeling en een paar labels over hoogte, periode en wind. Schrijf op basis daarvan één korte, natuurlijke zin
-(max 12 woorden) over hoe de surfdag aanvoelt.
+(max 11 woorden) over hoe de surfdag aanvoelt.
 
 ### Data
 - Kleur: {kleur}
@@ -396,12 +444,17 @@ Je krijgt een kleurbeoordeling en een paar labels over hoogte, periode en wind. 
 
 ### Richtlijnen
 - Gebruik de kleur als sentiment:
-  - 🟢 = goed, clean, krachtig, mooi venster, duidelijk surfbaar
+  - 🟢 = goed, clean, krachtig, duidelijk surfbaar, de moeite waard
   - 🟠 = oké, surfbaar maar wat rommelig of matig
   - 🔴 = slecht, weinig kracht, korte swell of te veel wind
 - Schrijf alsof je een maat appt over het surfweer.
 - Nuchtere spreektaal, geen poëzie, geen marketing.
 - Gebruik woorden als clean, rommelig, blown out, prima, matig, krachtig, klein, deining.
+- Vermijd deze zinnen en woorden expliciet:
+  - 'een beetje zee'
+  - 'om hier'
+  - 'matige golf'
+  - 'enigszins rommelig maar oké'
 - Geen cijfers, geen tijden, geen opsommingen.
 - Maximaal één zin.
 - Geef alleen de zin, zonder uitleg of aanhalingstekens.
@@ -489,7 +542,7 @@ def build_message(spot, summary):
     lines.append("")
     # Beste momenten
     if "Geen duidelijk goed moment" in best_today:
-        lines.append(f"👉 Beste moment: geen echt duidelijk venster vandaag.")
+        lines.append("👉 Beste moment: geen echt duidelijk venster vandaag.")
     else:
         if " en " in best_today:
             lines.append(f"👉 Beste momenten: {best_today}")
