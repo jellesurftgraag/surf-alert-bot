@@ -461,7 +461,7 @@ Je krijgt een kleurbeoordeling en een paar labels over hoogte, periode en wind. 
 """
 
     body = json.dumps({
-        "model": "llama-3.1-8b-instant",
+        "model": "openai/gpt-oss-120b",
         "messages": [
             {
                 "role": "system",
