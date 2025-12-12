@@ -1,4 +1,4 @@
-import os, json, datetime as dt, requests, http.client, statistics as stats
+import os, json, datetime as dt, requests, http.client, statistics as stats, re
 
 # -----------------------
 # Instellingen
@@ -12,6 +12,8 @@ TZ = "Europe/Amsterdam"
 
 DAGEN = ["Maandag", "Dinsdag", "Woensdag", "Donderdag", "Vrijdag", "Zaterdag", "Zondag"]
 MAANDEN = ["jan", "feb", "mrt", "apr", "mei", "jun", "jul", "aug", "sep", "okt", "nov", "dec"]
+
+MODEL_ID = "openai/gpt-oss-120b"  # <--- hier kun je later switchen
 
 # -----------------------
 # Data ophalen
@@ -46,18 +48,18 @@ def get_marine(lat, lon, days=2):
 # -----------------------
 def score_for_conditions(H, T, W, dir_type):
     """
-    Geeft een surf-score voor één set condities.
-    Belangrijkste principes:
-    - Zeer kleine hoogte (< 0.4 m) is vrijwel nooit surfbaar.
-    - Periode mag kleine hoogte niet 'redden'.
-    - Harde onshore wind wordt stevig afgestraft.
+    Surf-score per uur/dagdeel/dag.
+    Principes:
+    - <0.4m is praktisch niet surfbaar (cap).
+    - Periode helpt, maar redt microgolf niet.
+    - Harde onshore wordt stevig afgestraft.
     """
     if H is None or T is None or W is None:
         return 0.0
 
     score = 0.0
 
-    # Hoogte (basis)
+    # Hoogte
     if H < 0.4:
         height_score = 0.0
     elif 0.4 <= H < 0.6:
@@ -70,7 +72,7 @@ def score_for_conditions(H, T, W, dir_type):
         height_score = 1.2
     score += height_score
 
-    # Periode (maar niet alles compenseren)
+    # Periode
     if T >= 8:
         score += 1.0
     elif 7 <= T < 8:
@@ -80,9 +82,9 @@ def score_for_conditions(H, T, W, dir_type):
     elif 5 <= T < 6:
         score += 0.3
     else:
-        score += 0.0  # echt korte periodes helpen niet
+        score += 0.0
 
-    # Windkracht (minder belonen bij veel wind)
+    # Windkracht
     if W <= 10:
         score += 1.0
     elif 10 < W <= 18:
@@ -92,10 +94,9 @@ def score_for_conditions(H, T, W, dir_type):
     else:
         score += 0.0
 
-    # Windrichting / type
+    # Windrichting
     if dir_type == "offshore":
         score += 0.4
-        # maar bij echt harde offshore (> 25 km/u) niet té positief
         if W > 25:
             score -= 0.2
     elif dir_type == "onshore":
@@ -109,9 +110,7 @@ def score_for_conditions(H, T, W, dir_type):
         if W > 28:
             score -= 0.2
 
-    # Hardere caps op te kleine hoogte:
-    # - < 0.4 m: nooit boven 0.5 → praktisch altijd rood
-    # - 0.4–0.6 m: maximaal 1.0 → hooguit oranje
+    # Caps op te kleine hoogte
     if H < 0.4:
         score = min(score, 0.5)
     elif H < 0.6:
@@ -124,11 +123,13 @@ def score_for_conditions(H, T, W, dir_type):
 # -----------------------
 def summarize_forecast(marine, wind):
     hrs = marine["hourly"]["time"]
+
     # Correcties voor realistischer surfgevoel
     waves = [h * 1.4 if h is not None else None for h in marine["hourly"]["wave_height"]]
     periods = [(p + 1.0) if p is not None else None for p in marine["hourly"]["swell_wave_period"]]
     winds = wind["hourly"]["windspeed_10m"]   # km/u
     dirs = wind["hourly"]["winddirection_10m"]
+
     start_date = dt.date.fromisoformat(hrs[0][:10])
 
     def angle_diff(a, b):
@@ -137,6 +138,7 @@ def summarize_forecast(marine, wind):
     data = []
     for d in range(3):
         date = start_date + dt.timedelta(days=d)
+
         # indices 08–20u
         idx = [i for i, t in enumerate(hrs) if t.startswith(str(date)) and 8 <= int(t[11:13]) < 20]
         if not idx:
@@ -153,9 +155,9 @@ def summarize_forecast(marine, wind):
         min_w, max_w = min(ws), max(ws)
         min_h, max_h = min(wv), max(wv)
         min_t, max_t = min(pr), max(pr)
-        energy = 0.49 * avg_wave**2 * avg_per  # kJ/m
+        energy = 0.49 * avg_wave**2 * avg_per
 
-        # Windrichting t.o.v. kustlijn (voor dag-type)
+        # Dag windtype
         if angle_diff(avg_dir, 270) <= 60:
             day_wind_type = "onshore"
         elif angle_diff(avg_dir, 90) <= 60:
@@ -163,22 +165,23 @@ def summarize_forecast(marine, wind):
         else:
             day_wind_type = "sideshore"
 
-        # Dag-score (referentie)
         day_score = score_for_conditions(avg_wave, avg_per, avg_wind, day_wind_type)
 
-        # Uur-scores + lokale windrichtingen
+        # Uur-scores + meta
         hourly_scores = {}
-        hourly_meta = {}  # voor dagdelen (hoogte/periode/wind/dir per uur)
+        hourly_meta = {}
         for h in range(8, 20):
             h_idx = [i for i, t in enumerate(hrs) if t.startswith(str(date)) and int(t[11:13]) == h]
             if not h_idx:
                 continue
+
             Hw = [waves[i] for i in h_idx if waves[i] is not None]
             Tp = [periods[i] for i in h_idx if periods[i] is not None]
             Wv = [winds[i] for i in h_idx if winds[i] is not None]
             Dv = [dirs[i] for i in h_idx if dirs[i] is not None]
             if not (Hw and Tp and Wv and Dv):
                 continue
+
             h_wave = stats.mean(Hw)
             h_per = stats.mean(Tp)
             h_wind = stats.mean(Wv)
@@ -201,16 +204,12 @@ def summarize_forecast(marine, wind):
                 "wind_type": h_type,
             }
 
-        # drempel voor "goed" uur (combinatie absolute + relatieve drempel)
-        if hourly_scores:
-            max_hour_score = max(hourly_scores.values())
-        else:
-            max_hour_score = day_score
+        # drempel voor "goed" uur
         base_threshold = 1.0
         rel_threshold = 0.7 * max(day_score, 0.0001)
         threshold = max(base_threshold, rel_threshold)
 
-        # clusters bouwen van goede uren
+        # clusters van goede uren
         good_hours = sorted([h for h, s in hourly_scores.items() if s >= threshold])
         clusters = []
         if good_hours:
@@ -221,26 +220,14 @@ def summarize_forecast(marine, wind):
                     scores_cluster.append(hourly_scores[h])
                     prev = h
                 else:
-                    clusters.append({
-                        "start": start,
-                        "end": prev + 1,
-                        "score": stats.mean(scores_cluster),
-                    })
+                    clusters.append({"start": start, "end": prev + 1, "score": stats.mean(scores_cluster)})
                     start = prev = h
                     scores_cluster = [hourly_scores[h]]
-            clusters.append({
-                "start": start,
-                "end": prev + 1,
-                "score": stats.mean(scores_cluster),
-            })
+            clusters.append({"start": start, "end": prev + 1, "score": stats.mean(scores_cluster)})
 
-        # beste cluster-score voor kleur
-        if clusters:
-            best_cluster_score = max(c["score"] for c in clusters)
-        else:
-            best_cluster_score = day_score
+        best_cluster_score = max((c["score"] for c in clusters), default=day_score)
 
-        # Kleur op basis van beste cluster + energie
+        # Kleur dag (zelfde als eerder)
         if best_cluster_score >= 2.3 and energy >= 2.5:
             day_color = "🟢"
         elif best_cluster_score >= 1.0:
@@ -248,15 +235,8 @@ def summarize_forecast(marine, wind):
         else:
             day_color = "🔴"
 
-        # -----------------------
-        # Dagdelen (ochtend/middag/avond)
-        # -----------------------
-        dayparts_def = {
-            "Ochtend": (8, 12),
-            "Middag": (12, 16),
-            "Avond": (16, 20),
-        }
-
+        # Dagdelen
+        dayparts_def = {"Ochtend": (8, 12), "Middag": (12, 16), "Avond": (16, 20)}
         dayparts = {}
         for naam, (h_start, h_end) in dayparts_def.items():
             part_hours = [h for h in range(h_start, h_end) if h in hourly_meta]
@@ -267,15 +247,12 @@ def summarize_forecast(marine, wind):
             pper = [hourly_meta[h]["period"] for h in part_hours]
             pwinds = [hourly_meta[h]["wind"] for h in part_hours]
             pdirs = [hourly_meta[h]["dir"] for h in part_hours]
-            if not (pwaves and pper and pwinds and pdirs):
-                continue
 
             p_wave_avg = stats.mean(pwaves)
             p_per_avg = stats.mean(pper)
             p_wind_avg = stats.mean(pwinds)
             p_dir_avg = stats.mean(pdirs)
 
-            # lokale wind-type
             if angle_diff(p_dir_avg, 270) <= 60:
                 p_type = "onshore"
             elif angle_diff(p_dir_avg, 90) <= 60:
@@ -286,7 +263,6 @@ def summarize_forecast(marine, wind):
             p_score = score_for_conditions(p_wave_avg, p_per_avg, p_wind_avg, p_type)
             p_energy = 0.49 * p_wave_avg**2 * p_per_avg
 
-            # kleur per dagdeel
             if p_score >= 2.3 and p_energy >= 2.5:
                 p_color = "🟢"
             elif p_score >= 1.0:
@@ -322,7 +298,7 @@ def summarize_forecast(marine, wind):
     return data
 
 # -----------------------
-# Best-moment tekst uit clusters (exacte tijden)
+# Best-moment tekst (vandaag): 1-2 beste clusters, zoals je al had
 # -----------------------
 def best_moment_text(day):
     clusters = day.get("clusters") or []
@@ -338,156 +314,62 @@ def best_moment_text(day):
         if second["score"] >= 0.85 * top["score"]:
             moments.append(f"{second['start']:02d}–{second['end']:02d}u")
 
-    if len(moments) == 1:
-        return moments[0]
-    else:
-        return " en ".join(moments)
+    return " en ".join(moments)
 
 # -----------------------
-# Natuurlijke venstertekst voor morgen/overmorgen
+# Natuurlijke venstertekst (morgen/overmorgen) - menselijker
 # -----------------------
-def natural_window_phrase(day):
+def natural_window_phrase(day, nearly_all_day_hours=9):
     """
-    Maakt van de beste cluster een natuurlijke omschrijving:
-    - ≥ 9 uur: 'vrijwel de hele dag'
-    - 6–8 uur: 'een groot deel van de dag (HH–HHu)'
-    - 3–5 uur: 'tussen HH–HHu'
-    - 1–2 uur: 'even een venster rond HH–HHu'
-    - geen clusters: 'geen duidelijk goed venster'
+    Gebruikt de clusters maar praat menselijk:
+    - totaal goede uren >= 9: 'vrijwel de hele dag'
+    - anders: 'vooral HH–HHu' + (optioneel) 'later nog HH–HHu'
     """
     clusters = day.get("clusters") or []
     if not clusters:
         return "geen duidelijk goed venster"
 
-    clusters_sorted = sorted(clusters, key=lambda c: c["score"], reverse=True)
-    top = clusters_sorted[0]
-    length = top["end"] - top["start"]
+    # merge-achtige logica: tel unieke uren in good vensters
+    covered = set()
+    for c in clusters:
+        for h in range(c["start"], c["end"]):
+            covered.add(h)
+    total = len(covered)
 
-    if length >= 9:
+    # kies "hoofdvenster" = langste; bij gelijk: hoogste score
+    clusters_sorted = sorted(clusters, key=lambda c: ((c["end"] - c["start"]), c["score"]), reverse=True)
+    main = clusters_sorted[0]
+    main_len = main["end"] - main["start"]
+
+    if total >= nearly_all_day_hours:
         phrase = "vrijwel de hele dag"
-    elif length >= 6:
-        phrase = f"een groot deel van de dag ({top['start']:02d}–{top['end']:02d}u)"
-    elif length >= 3:
-        phrase = f"tussen {top['start']:02d}–{top['end']:02d}u"
-    else:
-        phrase = f"even een venster rond {top['start']:02d}–{top['end']:02d}u"
+        # alleen extra noemen als er echt een los, duidelijk blok is dat niet in main zit
+        extras = [c for c in clusters if c is not main and (c["end"] - c["start"]) >= 2 and c["score"] >= 0.85 * main["score"]]
+        extras = sorted(extras, key=lambda c: c["start"])
+        if extras:
+            e = extras[0]
+            phrase += f", met een extra piek {e['start']:02d}–{e['end']:02d}u"
+        return phrase
 
-    # Eventueel tweede duidelijk goed venster noemen
-    if len(clusters_sorted) > 1:
-        second = clusters_sorted[1]
-        if second["score"] >= 0.85 * top["score"]:
-            phrase += f" en nog een venster rond {second['start']:02d}–{second['end']:02d}u"
+    phrase = f"vooral {main['start']:02d}–{main['end']:02d}u"
+
+    # tweede blok: beste van de rest als het echt “iets toevoegt”
+    rest = [c for c in clusters if c is not main]
+    rest = sorted(rest, key=lambda c: c["score"], reverse=True)
+    if rest:
+        second = rest[0]
+        second_len = second["end"] - second["start"]
+        if second_len >= 1 and second["score"] >= 0.85 * main["score"]:
+            # formulering: "later nog" / "en ook"
+            if second["start"] > main["end"]:
+                phrase += f", later nog {second['start']:02d}–{second['end']:02d}u"
+            else:
+                phrase += f" en ook {second['start']:02d}–{second['end']:02d}u"
 
     return phrase
 
 # -----------------------
-# AI-tekst (gekoppeld aan kleur + labels)
-# -----------------------
-def ai_text(day):
-    kleur = day["color"]
-    wave = round(day["avg_wave"], 1)
-    period = round(day["avg_per"])
-    wind = round(day["avg_wind"])
-    dir_type = day.get("wind_type", "onbekend")
-    energy = round(day["energy"], 1)
-
-    # Labels voor extra context
-    if wave < 0.4:
-        wave_quality = "heel klein"
-    elif wave < 0.6:
-        wave_quality = "klein"
-    elif wave < 0.9:
-        wave_quality = "oké"
-    elif wave < 1.3:
-        wave_quality = "redelijk"
-    else:
-        wave_quality = "groot"
-
-    if period < 5:
-        period_quality = "kort"
-    elif period < 6:
-        period_quality = "redelijk"
-    elif period < 8:
-        period_quality = "lang"
-    else:
-        period_quality = "mooi lang"
-
-    if wind > 35:
-        wind_quality = "heel hard"
-    elif wind > 25:
-        wind_quality = "hard"
-    elif wind > 18:
-        wind_quality = "matig"
-    elif wind > 12:
-        wind_quality = "prima"
-    else:
-        wind_quality = "zacht"
-
-    if dir_type == "offshore":
-        wind_style = "clean"
-    elif dir_type == "onshore":
-        wind_style = "rommelig"
-    else:
-        wind_style = "neutraal"
-
-    prompt = f"""
-Je bent een ervaren Nederlandse surfcoach die korte, nuchtere updates schrijft over de surf aan de Noordzee (Scheveningen).
-Je krijgt een kleurbeoordeling en een paar labels over hoogte, periode en wind. Schrijf op basis daarvan één korte, natuurlijke zin
-(max 11 woorden) over hoe de surfdag aanvoelt.
-
-### Data
-- Kleur: {kleur}
-- Golfhoogte: {wave} m ({wave_quality})
-- Periode: {period} s ({period_quality})
-- Wind: {wind} km/u ({wind_quality}, {wind_style})
-- Energie: {energy} kJ/m
-
-### Richtlijnen
-- Gebruik de kleur als sentiment:
-  - 🟢 = goed, clean, krachtig, duidelijk surfbaar, de moeite waard
-  - 🟠 = oké, surfbaar maar wat rommelig of matig
-  - 🔴 = slecht, weinig kracht, korte swell of te veel wind
-- Schrijf alsof je een maat appt over het surfweer.
-- Nuchtere spreektaal, geen poëzie, geen marketing.
-- Gebruik woorden als clean, rommelig, blown out, prima, matig, krachtig, klein, deining.
-- Vermijd deze zinnen en woorden expliciet:
-  - 'een beetje zee'
-  - 'om hier'
-  - 'matige golf'
-  - 'enigszins rommelig maar oké'
-- Geen cijfers, geen tijden, geen opsommingen.
-- Maximaal één zin.
-- Geef alleen de zin, zonder uitleg of aanhalingstekens.
-"""
-
-    body = json.dumps({
-        "model": "openai/gpt-oss-120b",
-        "messages": [
-            {
-                "role": "system",
-                "content": "Je schrijft korte, realistische surfupdates in het Nederlands, in natuurlijke spreektaal."
-            },
-            {"role": "user", "content": prompt.strip()},
-        ],
-        "temperature": 0.7,
-        "max_tokens": 50,
-    })
-
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    conn = http.client.HTTPSConnection("api.groq.com")
-    conn.request("POST", "/openai/v1/chat/completions", body, headers)
-    res = conn.getresponse()
-    data = res.read().decode()
-
-    if res.status != 200:
-        return "Geen titel beschikbaar."
-    try:
-        return json.loads(data)["choices"][0]["message"]["content"].strip()
-    except Exception:
-        return "Geen titel beschikbaar."
-
-# -----------------------
-# Kleine helpers voor kleurwoorden / vierkantjes
+# Helpers voor kleuren
 # -----------------------
 def color_word(c):
     if c == "🟢":
@@ -506,41 +388,150 @@ def color_square(c):
     return c
 
 # -----------------------
+# Coach-AI: 1 zin, maar echt gebaseerd op surf-logica
+# -----------------------
+def _fallback_coach_line(day):
+    c = day["color"]
+    w = day["avg_wave"]
+    t = day["avg_per"]
+    wind = day["avg_wind"]
+    wt = day.get("wind_type", "sideshore")
+
+    # simpele maar betrouwbare fallback (geen tijden/cijfers in tekst)
+    if w < 0.45:
+        return "Klein en weinig power, vooral even kijken voor een longboard."
+    if wt == "offshore" and wind <= 18 and t >= 6:
+        return "Best netjes door offshore, met wat power in de sets."
+    if wt == "onshore" and wind >= 20:
+        return "Wind maakt het snel rommelig, vooral losse chop en weinig lijn."
+    if t < 5:
+        return "Korte periode, dus het voelt wat rommelig en minder krachtig."
+    if c == "🟢":
+        return "Prima surfdag, met genoeg lijn en af en toe een mooie set."
+    if c == "🟠":
+        return "Surfbaar, maar verwacht wisselende lijnen en wat rommel."
+    return "Lastige dag: weinig lijn of te veel wind voor echt lekker surfen."
+
+def _sanitize_ai_line(text: str) -> str:
+    if not text:
+        return ""
+    t = text.strip()
+    t = re.sub(r"\s+", " ", t)
+    # geen cijfers/tijden in de coach-zin
+    if re.search(r"\d", t):
+        return ""
+    # geen opsomming / meerdere regels
+    if "\n" in t:
+        t = t.split("\n")[0].strip()
+    # te kort/leeg
+    if len(t) < 6:
+        return ""
+    return t
+
+def ai_text(day):
+    """
+    1 coach-zin, zonder cijfers/tijden, maar wél met surf-logica:
+    windtype + windkracht -> clean/rommelig
+    periode -> power
+    hoogte -> size
+    """
+    kleur = day["color"]
+
+    # dagdelen compacte context
+    dp = day.get("dayparts", {})
+    def dp_str(name):
+        p = dp.get(name)
+        if not p:
+            return ""
+        return f"{name}: {p['h_min']:.1f}-{p['h_max']:.1f}m, {round(p['t_min'])}-{round(p['t_max'])}s, {round(p['wind_avg'])}km/u {p['wind_type']}"
+    dayparts_compact = "; ".join([s for s in [dp_str("Ochtend"), dp_str("Middag"), dp_str("Avond")] if s])
+
+    best = best_moment_text(day)
+
+    prompt = f"""
+Je bent een Nederlandse surfcoach voor Scheveningen.
+Schrijf EXACT 1 zin (8–16 woorden), alsof je een vriend appt: hoe voelt de surf vandaag?
+
+Je krijgt data. Je zin moet logisch kloppen met:
+- Hoogte + periode (power)
+- Windtype + windkracht (clean vs rommelig)
+- Kleur (stoplicht)
+- Beste momenten (mag je noemen als 'ochtend'/'middag', maar GEEN tijden/cijfers)
+
+DATA (intern, NIET letterlijk herhalen):
+- Stoplicht: {kleur}
+- Gemiddeld: hoogte {day['avg_wave']:.1f}m, periode {day['avg_per']:.0f}s, wind {day['avg_wind']:.0f}km/u, windtype {day.get('wind_type','sideshore')}
+- Dagdelen: {dayparts_compact}
+- Beste momenten (tijden): {best}
+
+REGELS:
+- Geen cijfers, geen tijden, geen meet-woorden (geen “m”, “s”, “km/u”, “kJ”).
+- Geen opsommingen.
+- Vermijd: "om hier", "een beetje zee", "matige golf".
+- Gebruik natuurlijk surf-taal: clean, rommelig, chop, lijnen, sets, power, longboard.
+- Als het vrijwel de hele dag hetzelfde is: zeg dat het “de hele dag” ongeveer zo blijft.
+- Output: alleen die ene zin.
+"""
+
+    body = json.dumps({
+        "model": MODEL_ID,
+        "messages": [
+            {"role": "system", "content": "Je bent een nuchtere Nederlandse surfcoach. Kort, menselijk, geen cijfers."},
+            {"role": "user", "content": prompt.strip()},
+        ],
+        "temperature": 0.55,     # iets strakker → minder rare zinnen
+        "max_tokens": 60,
+    })
+
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    conn = http.client.HTTPSConnection("api.groq.com")
+    conn.request("POST", "/openai/v1/chat/completions", body, headers)
+    res = conn.getresponse()
+    raw = res.read().decode()
+
+    if res.status != 200:
+        return _fallback_coach_line(day)
+
+    try:
+        txt = json.loads(raw)["choices"][0]["message"]["content"]
+    except Exception:
+        return _fallback_coach_line(day)
+
+    txt = _sanitize_ai_line(txt)
+    if not txt:
+        return _fallback_coach_line(day)
+    return txt
+
+# -----------------------
 # Bericht samenstellen
 # -----------------------
 def build_message(spot, summary):
     today = summary[0]
     d = today["date"]
     label = f"{DAGEN[d.weekday()]} {d.day} {MAANDEN[d.month-1]}"
-    ai_part = ai_text(today)
+
+    coach_line = ai_text(today)
     best_today = best_moment_text(today)
 
     lines = []
-    # Header met vierkantje + AI-conclusie
     lines.append(f"📅 {label}")
-    lines.append(f"{color_square(today['color'])} {ai_part}")
+    lines.append(f"{color_square(today['color'])} {coach_line}")
     lines.append("")
 
-    # Dagdelen (als we ze hebben)
+    # dagdelen
     dayparts = today.get("dayparts") or {}
     for naam in ["Ochtend", "Middag", "Avond"]:
         part = dayparts.get(naam)
         if not part:
             continue
         c = part["color"]
-        h_min = part["h_min"]
-        h_max = part["h_max"]
-        t_min = part["t_min"]
-        t_max = part["t_max"]
-        w_avg = part["wind_avg"]
-        w_type = part["wind_type"]
-
         lines.append(
-            f"{c} {naam}: {h_min:.1f}–{h_max:.1f} m / {round(t_min)}–{round(t_max)} s — ~{round(w_avg):.0f} km/u {w_type}"
+            f"{c} {naam}: {part['h_min']:.1f}–{part['h_max']:.1f} m / {round(part['t_min'])}–{round(part['t_max'])} s — ~{round(part['wind_avg'])} km/u {part['wind_type']}"
         )
 
     lines.append("")
-    # Beste momenten
+
+    # beste momenten
     if "Geen duidelijk goed moment" in best_today:
         lines.append("👉 Beste moment: geen echt duidelijk venster vandaag.")
     else:
@@ -551,33 +542,30 @@ def build_message(spot, summary):
 
     lines.append("")
 
-    # Morgen / overmorgen met natuurlijke venstertaal
+    # Morgen / overmorgen
     if len(summary) > 1:
         t = summary[1]
-        phrase_t = natural_window_phrase(t)
-        if "geen duidelijk goed venster" in phrase_t:
+        phrase_t = natural_window_phrase(t, nearly_all_day_hours=9)
+        if phrase_t == "geen duidelijk goed venster":
             lines.append(
-                f"{color_square(t['color'])} Morgen: {phrase_t}, "
-                f"met ~{t['avg_wave']:.1f} m en {round(t['avg_per'])} s swell."
+                f"{color_square(t['color'])} Morgen: geen duidelijk goed venster, met ~{t['avg_wave']:.1f} m en {round(t['avg_per'])} s swell."
             )
         else:
+            # menselijker: geen “rond”
             lines.append(
-                f"{color_square(t['color'])} Morgen: {phrase_t} {color_word(t['color'])} surf, "
-                f"met ~{t['avg_wave']:.1f} m en {round(t['avg_per'])} s swell."
+                f"{color_square(t['color'])} Morgen: {phrase_t} {color_word(t['color'])} surf, met ~{t['avg_wave']:.1f} m en {round(t['avg_per'])} s swell."
             )
 
     if len(summary) > 2:
         o = summary[2]
-        phrase_o = natural_window_phrase(o)
-        if "geen duidelijk goed venster" in phrase_o:
+        phrase_o = natural_window_phrase(o, nearly_all_day_hours=9)
+        if phrase_o == "geen duidelijk goed venster":
             lines.append(
-                f"{color_square(o['color'])} Overmorgen: {phrase_o}, "
-                f"met ~{o['avg_wave']:.1f} m en {round(o['avg_per'])} s swell."
+                f"{color_square(o['color'])} Overmorgen: geen duidelijk goed venster, met ~{o['avg_wave']:.1f} m en {round(o['avg_per'])} s swell."
             )
         else:
             lines.append(
-                f"{color_square(o['color'])} Overmorgen: {phrase_o} {color_word(o['color'])} surf, "
-                f"met ~{o['avg_wave']:.1f} m en {round(o['avg_per'])} s swell."
+                f"{color_square(o['color'])} Overmorgen: {phrase_o} {color_word(o['color'])} surf, met ~{o['avg_wave']:.1f} m en {round(o['avg_per'])} s swell."
             )
 
     return "\n".join(lines)
