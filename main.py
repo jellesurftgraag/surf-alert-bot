@@ -22,6 +22,12 @@ DAYPARTS_DEF = {
 }
 
 # =======================
+# Nieuwe harde regels
+# =======================
+PERIOD_ORANGE_MIN_S = 6  # <6s is altijd rood, vanaf 6s mag oranje (of groen)
+
+
+# =======================
 # Data ophalen
 # =======================
 def get_marine(lat, lon, days=2):
@@ -65,6 +71,36 @@ def wind_type_from_dir(direction_deg):
 
 
 # =======================
+# Helpers: netjes formatteren
+# =======================
+def _round_safe(x, ndigits=0):
+    if x is None:
+        return None
+    return round(float(x), ndigits)
+
+
+def format_range(lo, hi, *, ndigits=0, unit="", dash="–"):
+    """
+    Als lo en hi gelijk zijn na afronden, toon één waarde.
+    Voorbeelden:
+      5.0, 5.0 -> "5 s"
+      5.0, 6.0 -> "5–6 s"
+      0.4, 0.4 -> "0.4 m"
+    """
+    if lo is None or hi is None:
+        return ""
+    lo_r = _round_safe(lo, ndigits)
+    hi_r = _round_safe(hi, ndigits)
+    if lo_r == hi_r:
+        return f"{lo_r:.{ndigits}f}{(' ' + unit) if unit else ''}"
+    return f"{lo_r:.{ndigits}f}{dash}{hi_r:.{ndigits}f}{(' ' + unit) if unit else ''}"
+
+
+def period_is_short(T):
+    return (T is not None) and (T < PERIOD_ORANGE_MIN_S)
+
+
+# =======================
 # Surf score
 # =======================
 def score_for_conditions(H, T, W, dir_type):
@@ -74,6 +110,8 @@ def score_for_conditions(H, T, W, dir_type):
     - Te klein blijft te klein (caps)
     - Periode helpt, maar redt microgolf niet
     - Harde onshore straft af
+
+    Let op: kleur wordt later alsnog hard afgekapt bij T < 6s.
     """
     if H is None or T is None or W is None:
         return 0.0
@@ -143,6 +181,15 @@ def color_from_score_energy(best_score, energy):
     return "🔴"
 
 
+def enforce_period_rule(color, T_rep):
+    """
+    Harde regel: onder 6 seconden is altijd rood.
+    """
+    if period_is_short(T_rep):
+        return "🔴"
+    return color
+
+
 def color_square(c):
     if c == "🟢":
         return "🟩"
@@ -153,26 +200,18 @@ def color_square(c):
     return "🟧"
 
 
-def color_word(c):
-    if c == "🟢":
-        return "goed"
-    if c == "🟠":
-        return "oké"
-    return "slecht"
-
-
 # =======================
 # Forecast samenvatten
 # =======================
 def summarize_forecast(marine, wind):
     hrs = marine["hourly"]["time"]
 
-    # Belangrijk: 0.0 is geldig, dus check op None, niet op truthy
     waves_raw = marine["hourly"]["wave_height"]
     periods_raw = marine["hourly"]["swell_wave_period"]
     winds_raw = wind["hourly"]["windspeed_10m"]
     dirs_raw = wind["hourly"]["winddirection_10m"]
 
+    # jouw kalibratie
     waves = [(h * 1.4) if h is not None else None for h in waves_raw]
     periods = [(p + 1.0) if p is not None else None for p in periods_raw]
     winds = [w if w is not None else None for w in winds_raw]
@@ -200,6 +239,9 @@ def summarize_forecast(marine, wind):
 
         avg_wave = stats.mean(wv)
         avg_per = stats.mean(pr)
+        # representatief voor harde periode-regel: median is rustiger
+        rep_per = stats.median(pr)
+
         avg_wind = stats.mean(ws)
         avg_dir = stats.mean(wd)
         energy = 0.49 * (avg_wave ** 2) * avg_per
@@ -243,6 +285,7 @@ def summarize_forecast(marine, wind):
         rel_threshold = 0.7 * max(day_score, 0.0001)
         threshold = max(base_threshold, rel_threshold)
 
+        # Clusters blijven score-based, maar we zullen later "korte-periode dagen" niet promoten als venster
         good_hours = sorted([h for h, s in hourly_scores.items() if s >= threshold])
 
         clusters = []
@@ -269,6 +312,7 @@ def summarize_forecast(marine, wind):
 
         best_cluster_score = max((c["score"] for c in clusters), default=day_score)
         day_color = color_from_score_energy(best_cluster_score, energy)
+        day_color = enforce_period_rule(day_color, rep_per)
 
         # Dagdelen
         dayparts = {}
@@ -284,6 +328,8 @@ def summarize_forecast(marine, wind):
 
             p_wave_avg = stats.mean(pw)
             p_per_avg = stats.mean(pt)
+            p_per_rep = stats.median(pt)
+
             p_wind_avg = stats.mean(pwind)
             p_dir_avg = stats.mean(pdir)
 
@@ -291,6 +337,7 @@ def summarize_forecast(marine, wind):
             p_score = score_for_conditions(p_wave_avg, p_per_avg, p_wind_avg, p_type)
             p_energy = 0.49 * (p_wave_avg ** 2) * p_per_avg
             p_color = color_from_score_energy(p_score, p_energy)
+            p_color = enforce_period_rule(p_color, p_per_rep)
 
             dayparts[name] = {
                 "color": p_color,
@@ -298,6 +345,7 @@ def summarize_forecast(marine, wind):
                 "h_max": max(pw),
                 "t_min": min(pt),
                 "t_max": max(pt),
+                "t_rep": p_per_rep,
                 "wind_avg": p_wind_avg,
                 "wind_type": p_type,
                 "score": p_score,
@@ -308,6 +356,7 @@ def summarize_forecast(marine, wind):
             "color": day_color,
             "avg_wave": avg_wave,
             "avg_per": avg_per,
+            "rep_per": rep_per,
             "avg_wind": avg_wind,
             "wind_type": day_wind_type,
             "energy": energy,
@@ -328,8 +377,11 @@ def best_moment_text(day):
     if not clusters:
         return ""
 
-    # 1e op score, 2e op lengte
-    clusters_sorted = sorted(clusters, key=lambda c: (c["score"], (c["end"] - c["start"])), reverse=True)
+    clusters_sorted = sorted(
+        clusters,
+        key=lambda c: (c["score"], (c["end"] - c["start"])),
+        reverse=True
+    )
     top = clusters_sorted[0]
     moments = [f"{top['start']:02d}–{top['end']:02d}u"]
 
@@ -352,7 +404,6 @@ def natural_window_phrase(day, nearly_all_day_hours=9):
             covered.add(h)
     total = len(covered)
 
-    # hoofdblok: langste, bij gelijk hoogste score
     clusters_sorted = sorted(clusters, key=lambda c: ((c["end"] - c["start"]), c["score"]), reverse=True)
     main = clusters_sorted[0]
 
@@ -374,7 +425,10 @@ def natural_window_phrase(day, nearly_all_day_hours=9):
 
 
 def best_moments_line_for_today(day):
-    # Geen nep-moment als het de hele dag hetzelfde is
+    # Als de periode te kort is, niet doen alsof er een echt "beste" venster is
+    if period_is_short(day.get("rep_per", day.get("avg_per"))):
+        return "👉 Beste moment: geen echt venster (te korte periode, vooral rommel)"
+
     phrase = natural_window_phrase(day, nearly_all_day_hours=9)
     if phrase == "vrijwel de hele dag":
         return "👉 Beste momenten: de hele dag vrij consistent (08–20u)"
@@ -408,25 +462,23 @@ def _fallback_coach_line(day):
     w, t, wind = day["avg_wave"], day["avg_per"], day["avg_wind"]
     wt = day.get("wind_type", "sideshore")
 
+    if period_is_short(day.get("rep_per", t)):
+        if wt == "onshore" and wind >= 12:
+            return "Te korte periode en wind erbij, vooral rommelig en weinig lijn."
+        return "Korte periode, dus vooral rommelig en weinig echte power."
+
     if w < 0.45:
         return "Klein en weinig power, longboard is je beste kans."
-    if w < 0.7 and t <= 5:
+    if w < 0.7 and t <= 6:
         return "Klein en kort, longboard of funboard werkt het lekkerst."
     if wt == "onshore" and wind >= 18:
         return "Onshore maakt het rommelig, vooral voor beginners wat taai."
-    if t < 5:
-        return "Korte periode, dus snel rommelig en minder echte power."
     if wt == "offshore" and wind <= 18 and t >= 6:
         return "Netter door offshore, lekker voor een ervaren shortboard sessie."
     return "Surfbaar, maar verwacht wisselende lijnen en wat rommel."
 
 
 def _ai_coach(day, purpose="today"):
-    """
-    purpose:
-      - "today": hoofdzin
-      - "future": mini coachzin voor morgen/overmorgen
-    """
     payload = {
         "stoplicht": day["color"],
         "avg": {
@@ -451,16 +503,18 @@ def _ai_coach(day, purpose="today"):
 
     if purpose == "future":
         instruction = (
-            "Schrijf 1 korte zin (7–14 woorden) als surfcoach voor morgen/overmorgen. "
-            "Geen cijfers of tijden. Vermijd vaste tekst zoals 'oké surf'. "
-            "Zeg iets over wind (clean/rommelig) en power (periode/hoogte)."
+            "Schrijf 1 korte zin (7-14 woorden) als surfcoach voor morgen/overmorgen. "
+            "Geen cijfers of tijden. "
+            "Zeg iets over wind (clean/rommelig) en power (periode/hoogte). "
+            "Als de periode kort is, wees duidelijk dat het vooral rommelig is."
         )
     else:
         instruction = (
-            "Schrijf 1 zin (8–16 woorden) als surfcoach voor vandaag. "
+            "Schrijf 1 zin (8-16 woorden) als surfcoach voor vandaag. "
             "Geen cijfers of tijden of units. "
             "Je mag soms longboard/shortboard of beginner/ervaren noemen als het logisch is. "
-            "Laat de zin kloppen met wind (clean/rommelig) en power (periode)."
+            "Laat de zin kloppen met wind (clean/rommelig) en power (periode). "
+            "Als de periode kort is, zeg niet dat het 'surfbaar' of 'prima' is."
         )
 
     prompt = f"""{instruction}
@@ -500,7 +554,14 @@ Context (niet letterlijk herhalen):
     except Exception:
         return ""
 
-    return _sanitize_one_line(txt)
+    txt = _sanitize_one_line(txt)
+
+    # Guardrail: bij korte periode geen te positieve AI-zin
+    if txt and period_is_short(day.get("rep_per", day.get("avg_per"))):
+        lowered = txt.lower()
+        if any(w in lowered for w in ["surfbaar", "prima", "lekker", "goed", "top"]):
+            return ""
+    return txt
 
 
 def coach_line_today(day):
@@ -512,7 +573,11 @@ def coach_line_future(day):
     txt = _ai_coach(day, purpose="future")
     if txt:
         return txt
-    # fallback future: iets neutraler
+
+    # fallback future: consistent met periode-regel
+    if period_is_short(day.get("rep_per", day.get("avg_per"))):
+        return "Waarschijnlijk vooral rommelig en kort, weinig echte lijnen."
+
     c = day["color"]
     if c == "🟢":
         return "Lijkt een prima surfdag met wat meer lijn en betere sets."
@@ -540,10 +605,14 @@ def build_message(summary):
         part = dp.get(name)
         if not part:
             continue
+
+        h_txt = format_range(part["h_min"], part["h_max"], ndigits=1, unit="m")
+        # periode als integer, maar zonder 5-5
+        t_txt = format_range(part["t_min"], part["t_max"], ndigits=0, unit="s")
+
         lines.append(
             f"{part['color']} {name}: "
-            f"{part['h_min']:.1f}–{part['h_max']:.1f} m / "
-            f"{round(part['t_min'])}–{round(part['t_max'])} s "
+            f"{h_txt} / {t_txt} "
             f"~{round(part['wind_avg'])} km/u {part['wind_type']}"
         )
 
@@ -551,7 +620,7 @@ def build_message(summary):
     lines.append(best_moments_line_for_today(today))
     lines.append("")
 
-    # Morgen / overmorgen
+    # Morgen / overmorgen: als periode kort is, niet als "surfbaar" framen via kleur
     if len(summary) > 1:
         t = summary[1]
         phrase_t = natural_window_phrase(t, nearly_all_day_hours=9)
