@@ -178,7 +178,6 @@ def color_square(c):
 # Analyse (de kern)
 # =======================
 def build_day_features(hrs, waves, periods, winds, dirs, date):
-    # uren 08-20
     ids = [
         i for i, ts in enumerate(hrs)
         if ts.startswith(str(date)) and 8 <= int(ts[11:13]) < 20
@@ -186,7 +185,6 @@ def build_day_features(hrs, waves, periods, winds, dirs, date):
     if not ids:
         return None
 
-    # hourly meta (08-20, per heel uur)
     hourly = {}
     for h in range(8, 20):
         ixs = [i for i in ids if int(hrs[i][11:13]) == h]
@@ -199,7 +197,7 @@ def build_day_features(hrs, waves, periods, winds, dirs, date):
         wt = wind_type_from_dir(dr)
         hourly[h] = {"wave": hw, "period": tp, "wind": ws, "wind_type": wt}
 
-    if len(hourly) < 6:  # te weinig
+    if len(hourly) < 6:
         return None
 
     waves_h = [hourly[h]["wave"] for h in sorted(hourly)]
@@ -212,13 +210,11 @@ def build_day_features(hrs, waves, periods, winds, dirs, date):
     rep_per = stats.median(per_h)
     avg_wind = stats.mean(wind_h)
 
-    # windrichting representatief via meerderheid (stabieler dan "avg degrees")
     day_wt = max(set(wtype_h), key=wtype_h.count)
 
     energy = 0.49 * (avg_wave ** 2) * avg_per
     day_score = score_for_conditions(avg_wave, avg_per, avg_wind, day_wt)
 
-    # clusters: bepaal "goede" uren relatief aan dagscore
     hourly_scores = {}
     for h in hourly:
         s = score_for_conditions(hourly[h]["wave"], hourly[h]["period"], hourly[h]["wind"], hourly[h]["wind_type"])
@@ -269,17 +265,11 @@ def build_day_features(hrs, waves, periods, winds, dirs, date):
     }
 
     hourly_compact = [
-        {
-            "h": h,
-            "w": round(hourly[h]["wave"], 2),
-            "t": round(hourly[h]["period"], 1),
-            "ws": round(hourly[h]["wind"], 1),
-            "wt": hourly[h]["wind_type"],
-        }
+        {"h": h, "w": round(hourly[h]["wave"], 2), "t": round(hourly[h]["period"], 1),
+         "ws": round(hourly[h]["wind"], 1), "wt": hourly[h]["wind_type"]}
         for h in sorted(hourly)
     ]
 
-    # dagdelen
     dayparts = {}
     for name, (h0, h1) in DAYPARTS_DEF.items():
         hs = [h for h in range(h0, h1) if h in hourly]
@@ -337,7 +327,6 @@ def summarize_forecast(marine, wind, days_out=3):
     winds_raw = wind["hourly"]["windspeed_10m"]
     dirs_raw = wind["hourly"]["winddirection_10m"]
 
-    # jouw kalibratie
     waves = [(h * 1.4) if h is not None else None for h in waves_raw]
     periods = [(p + 1.0) if p is not None else None for p in periods_raw]
     winds = [w if w is not None else None for w in winds_raw]
@@ -371,8 +360,8 @@ def natural_window_phrase(day, nearly_all_day_hours=9):
 
     if total >= nearly_all_day_hours:
         return "vrijwel de hele dag"
-    phrase = f"vooral {main['start']:02d}–{main['end']:02d}u"
 
+    phrase = f"vooral {main['start']:02d}–{main['end']:02d}u"
     if len(clusters_sorted) > 1:
         second = clusters_sorted[1]
         if second["score"] >= 0.85 * main["score"]:
@@ -400,8 +389,23 @@ def best_moments_line(day):
 
 
 # =======================
-# AI coach (menselijker, kijkt naar diag/hourly)
+# AI coach (vaste stijl + data-onderbouwing)
 # =======================
+SYSTEM_COACH = (
+    "Je bent een nuchtere maar enthousiaste Nederlandse surfcoach voor de Noordzee. "
+    "Je bent eerlijk: hoogte alleen maakt het niet goed; wind en periode zijn doorslaggevend. "
+    "Je praat als tegen een vaste surfmaat: kort, warm, concreet, zonder hype. "
+    "Je benoemt beperkingen en twijfel als het net-aan is. "
+    "Enthousiasme is verdiend: op groen mag je echt blij zijn. "
+    "Op oranje mag je zeggen dat er 'heerlijke momenten' tussenzitten, maar noem het geen 'heerlijk surfen'. "
+    "Op rood ben je duidelijk dat het vooral rommelig/taai is. "
+    "Voorbeelden van toon (niet letterlijk kopiëren): "
+    "‘Met wat geduld zitten er best bruikbare setjes tussen, al blijft het wisselend.’ "
+    "‘Geen droomdag, maar zeker de moeite als je verwachtingen bijstelt.’ "
+    "‘Hoogte zat, maar de wind drukt het snel plat; vooral werken voor je golven.’ "
+    "‘Alles valt redelijk op z’n plek vandaag, mooie kans om meters te maken.’"
+)
+
 def _sanitize_coach(text):
     if not text:
         return ""
@@ -418,6 +422,13 @@ def _sanitize_coach(text):
     if len(t) < 8:
         return ""
     return t
+
+
+def _contains_heerlijk_surfen(text):
+    if not text:
+        return False
+    # Blokkeer specifiek "heerlijk surfen" (maar laat "heerlijke momenten" met rust)
+    return re.search(r"\bheerlij\w*\s+surfen\b", text.lower()) is not None
 
 
 def _ai_coach(day, purpose="today"):
@@ -446,28 +457,32 @@ def _ai_coach(day, purpose="today"):
         "window_phrase": natural_window_phrase(day),
     }
 
-    instruction = (
-        "Schrijf 1 korte, menselijke surfcoach-zin (10-20 woorden). "
-        "Je mag 1-2 getallen noemen (hoogte/periode/wind), maar noem geen tijden. "
-        "Onderbouw je conclusie met 2 concrete signalen uit de uurdata "
-        "(bijv. veel onshore, korte periode, wind neemt toe/af, piek in hoogte, stabiele periode). "
-        "Als de periode onder 6s is, zeg duidelijk dat het vooral rommelig en kort is."
-    )
     if purpose == "future":
         instruction = (
             "Schrijf 1 korte, menselijke surfcoach-zin (10-18 woorden) voor morgen/overmorgen. "
             "Je mag 1-2 getallen noemen (hoogte/periode/wind), maar noem geen tijden. "
-            "Gebruik 2 signalen uit de uurdata om uit te leggen waarom het wel/niet werkt."
+            "Onderbouw met 2 signalen uit de uurdata (windrichting-aandeel, periode, windsterkte, stabiliteit, piek). "
+            "Pas je enthousiasme aan op stoplicht (groen blij, oranje genuanceerd, rood duidelijk)."
+        )
+    else:
+        instruction = (
+            "Schrijf 1 korte, menselijke surfcoach-zin (10-20 woorden) voor vandaag. "
+            "Je mag 1-2 getallen noemen (hoogte/periode/wind), maar noem geen tijden. "
+            "Onderbouw met 2 signalen uit de uurdata (windrichting-aandeel, periode, windsterkte, stabiliteit, piek). "
+            "Als stoplicht groen is, mag je echt enthousiast zijn. "
+            "Als stoplicht oranje is, mag je zeggen dat er heerlijke momenten tussenzitten, "
+            "maar noem het geen 'heerlijk surfen'. "
+            "Als stoplicht rood is, wees helder dat het rommelig/taai is."
         )
 
     body = json.dumps({
         "model": MODEL_ID,
         "messages": [
-            {"role": "system", "content": "Je bent een nuchtere Nederlandse surfcoach. Kort, menselijk, concreet."},
+            {"role": "system", "content": SYSTEM_COACH},
             {"role": "user", "content": f"{instruction}\n\nData:\n{json.dumps(payload, ensure_ascii=False)}"},
         ],
-        "temperature": 0.75,
-        "max_tokens": 90,
+        "temperature": 0.8,
+        "max_tokens": 95,
     })
 
     conn = http.client.HTTPSConnection("api.groq.com")
@@ -493,11 +508,11 @@ def _ai_coach(day, purpose="today"):
 
     txt = _sanitize_coach(txt)
 
-    # soft guardrail: bij korte periode niet te positief
-    if txt and period_is_short(day.get("rep_per", day.get("avg_per"))):
-        lowered = txt.lower()
-        if any(w in lowered for w in ["top", "lekker", "goed", "prima", "clean", "glassy"]):
-            return ""
+    # Mini-guardrail precies zoals jij wil:
+    # "heerlijk surfen" alleen bij groen.
+    if txt and day.get("color") != "🟢" and _contains_heerlijk_surfen(txt):
+        return ""
+
     return txt
 
 
@@ -517,10 +532,10 @@ def fallback_coach(day):
     if w < 0.7 and t <= 6:
         return "Klein en kort, longboard of funboard werkt het lekkerst."
     if wt == "onshore" and wind >= 18:
-        return "Onshore maakt het rommelig en rompt snel dicht."
+        return "Hoogte zat, maar de wind drukt het snel plat; vooral werken voor je golven."
     if wt == "offshore" and wind <= 18 and t >= 6:
-        return "Offshore helpt de lijnen, met wat geluk nette setjes."
-    return "Wisselend, maar met geduld kun je wat bruikbare setjes meepakken."
+        return "Wind helpt mee en de periode geeft ruimte, hier kun je lekker doorpakken."
+    return "Met wat geduld zitten er best bruikbare setjes tussen, al blijft het wisselend."
 
 
 def coach_line(day, purpose="today"):
