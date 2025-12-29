@@ -2,6 +2,7 @@ import os
 import json
 import re
 import math
+import time
 import http.client
 import datetime as dt
 import statistics as stats
@@ -41,10 +42,31 @@ PERIOD_Q_HI = 0.80
 
 
 # =======================
+# Network helpers (FIX: retries)
+# =======================
+def _safe_get_json(url, params, *, timeout=20, retries=3, backoff_s=2):
+    """
+    Betrouwbare GET voor Open-Meteo: retries + lineaire backoff.
+    Dit verandert je surfoutput niet, alleen de stabiliteit.
+    """
+    last_err = None
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(backoff_s * (attempt + 1))
+    raise RuntimeError(f"GET faalde na {retries} pogingen: {url} ({last_err})")
+
+
+# =======================
 # Fetch Open-Meteo
 # =======================
 def get_open_meteo(lat, lon, days=2):
-    marine = requests.get(
+    marine = _safe_get_json(
         "https://marine-api.open-meteo.com/v1/marine",
         params={
             "latitude": lat,
@@ -53,10 +75,12 @@ def get_open_meteo(lat, lon, days=2):
             "hourly": "wave_height,swell_wave_period,wave_period,swell_wave_peak_period",
             "forecast_days": days + 1,
         },
-        timeout=30,
-    ).json()
+        timeout=20,
+        retries=3,
+        backoff_s=2,
+    )
 
-    wind = requests.get(
+    wind = _safe_get_json(
         "https://api.open-meteo.com/v1/forecast",
         params={
             "latitude": lat,
@@ -65,8 +89,10 @@ def get_open_meteo(lat, lon, days=2):
             "hourly": "windspeed_10m,winddirection_10m",
             "forecast_days": days + 1,
         },
-        timeout=30,
-    ).json()
+        timeout=20,
+        retries=3,
+        backoff_s=2,
+    )
 
     return marine, wind
 
@@ -260,8 +286,6 @@ def choose_period_hour(t_peak, t_wave, t_swell):
     1) peak, maar alleen als niet absurd afwijkt van wave/swell
     2) wave
     3) swell
-
-    Dit behoudt gevoeligheid, maar voorkomt dat 1 rare peak het dagdeel sloopt.
     """
     candidates = []
     if t_peak is not None:
@@ -274,16 +298,13 @@ def choose_period_hour(t_peak, t_wave, t_swell):
     if not candidates:
         return (None, None)
 
-    # Als peak bestaat, check of peak niet te ver van de rest ligt
     if t_peak is not None:
         refs = [v for k, v in candidates if k in ("wave", "swell") and v is not None]
         if refs:
             ref = stats.median(refs)
-            # Peak mag afwijken, maar niet extreem. 4s verschil is meestal "ander systeem" of ruis.
             if abs(t_peak - ref) <= 4.0:
                 return ("peak", t_peak)
 
-    # Anders: wave, dan swell
     if t_wave is not None:
         return ("wave", t_wave)
     return ("swell", t_swell)
@@ -343,13 +364,11 @@ def build_day_features(hrs, waves, t_swell, t_wave, t_peak, winds, dirs, date):
     rep_per = stats.median(per_h)
     avg_wind = stats.mean(wind_h)
 
-    # representatieve windrichting via meerderheid
     day_wt = max(set(wtype_h), key=wtype_h.count)
 
     energy = 0.49 * (avg_wave ** 2) * avg_per
     day_score = score_for_conditions(avg_wave, avg_per, avg_wind, day_wt)
 
-    # clusters
     hourly_scores = {
         h: score_for_conditions(hourly[h]["wave"], hourly[h]["period"], hourly[h]["wind"], hourly[h]["wind_type"])
         for h in hours_sorted
@@ -382,7 +401,6 @@ def build_day_features(hrs, waves, t_swell, t_wave, t_peak, winds, dirs, date):
     def pct(val):
         return round(100 * sum(1 for x in wtype_h if x == val) / len(wtype_h))
 
-    # bronverdeling periode
     srcs = [hourly[h]["period_src"] for h in hours_sorted if hourly[h]["period_src"]]
     src_mode = max(set(srcs), key=srcs.count) if srcs else "unknown"
 
@@ -419,7 +437,6 @@ def build_day_features(hrs, waves, t_swell, t_wave, t_peak, winds, dirs, date):
         for h in hours_sorted
     ]
 
-    # dagdelen
     dayparts = {}
     for name, (h0, h1) in DAYPARTS_DEF.items():
         hs = [h for h in range(h0, h1) if h in hourly]
@@ -577,7 +594,6 @@ def _sanitize_coach(text):
     t = re.sub(r"\s+", " ", t)
     t = t.split("\n")[0].strip()
 
-    # geen tijden
     if re.search(r"\b(\d{1,2})\s*(u|uur)\b", t.lower()):
         return ""
     if re.search(r"\b\d{1,2}[:.]\d{2}\b", t):
@@ -760,25 +776,46 @@ def build_message(summary):
 # Telegram
 # =======================
 def send_telegram_message(text):
-    requests.post(
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN ontbreekt (env var leeg).")
+    if not TELEGRAM_CHAT_ID:
+        raise RuntimeError("TELEGRAM_CHAT_ID ontbreekt (env var leeg).")
+
+    r = requests.post(
         f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-        json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+        json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True},
         timeout=20,
-    ).raise_for_status()
+    )
+
+    if r.status_code != 200:
+        try:
+            detail = r.json()
+        except Exception:
+            detail = r.text
+        raise RuntimeError(f"Telegram API error {r.status_code}: {detail}")
+
+    return True
 
 
 # =======================
-# Main
+# Main (FIX: never crash silently)
 # =======================
 if __name__ == "__main__":
-    marine, wind = get_open_meteo(SPOT["lat"], SPOT["lon"], days=2)
-    summary = summarize_forecast(marine, wind, days_out=3)
+    try:
+        marine, wind = get_open_meteo(SPOT["lat"], SPOT["lon"], days=2)
+        summary = summarize_forecast(marine, wind, days_out=3)
 
-    if not summary:
-        send_telegram_message("Geen surfdata beschikbaar vandaag.")
-    else:
-        message = build_message(summary)
-        print("----- SURF MESSAGE START -----")
-        print(message)
-        print("----- SURF MESSAGE END -----")
-        send_telegram_message(message)
+        if not summary:
+            message = "Geen surfdata beschikbaar vandaag."
+        else:
+            message = build_message(summary)
+
+    except Exception as e:
+        message = f"Surfbot: Open-Meteo tijdelijk traag/onbereikbaar. ({str(e)[:220]})"
+
+    print("----- SURF MESSAGE START -----")
+    print(message)
+    print("----- SURF MESSAGE END -----")
+
+    # altijd proberen te sturen
+    send_telegram_message(message)
