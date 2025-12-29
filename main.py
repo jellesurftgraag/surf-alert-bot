@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import math
 import http.client
 import datetime as dt
 import statistics as stats
@@ -30,18 +31,29 @@ DAYPARTS_DEF = {
 # Harde regel
 PERIOD_ORANGE_MIN_S = 6  # <6s altijd rood
 
+# Kalibratie (houd eenvoudig aanpasbaar)
+WAVE_MULT = 1.4
+PERIOD_BIAS_S = 1.0  # je oude +1s; zet op 0.0 als je wilt testen
+
 
 # =======================
 # Fetch
 # =======================
 def get_open_meteo(lat, lon, days=2):
+    """
+    We vragen bewust meerdere period-varianten op.
+    Open-Meteo ondersteunt o.a.:
+      - swell_wave_period
+      - wave_period
+      - swell_wave_peak_period
+    """
     marine = requests.get(
         "https://marine-api.open-meteo.com/v1/marine",
         params={
             "latitude": lat,
             "longitude": lon,
             "timezone": TZ,
-            "hourly": "wave_height,swell_wave_period",
+            "hourly": "wave_height,swell_wave_period,wave_period,swell_wave_peak_period",
             "forecast_days": days + 1,
         },
         timeout=30,
@@ -92,6 +104,22 @@ def fmt_range(lo, hi, ndigits=0, unit=""):
     if lo_r == hi_r:
         return f"{lo_r:.{ndigits}f}{(' ' + unit) if unit else ''}"
     return f"{lo_r:.{ndigits}f}–{hi_r:.{ndigits}f}{(' ' + unit) if unit else ''}"
+
+
+def fmt_period_range_floor_ceil(lo, hi, unit="s"):
+    """
+    Belangrijk voor consistentie met kleur rond de 6s-grens:
+    - Toon lo als floor
+    - Toon hi als ceil
+    Zo voorkom je '6 s' terwijl de onderkant eigenlijk 5.x is.
+    """
+    if lo is None or hi is None:
+        return ""
+    lo_i = int(math.floor(float(lo)))
+    hi_i = int(math.ceil(float(hi)))
+    if lo_i == hi_i:
+        return f"{lo_i} {unit}"
+    return f"{lo_i}–{hi_i} {unit}"
 
 
 # =======================
@@ -175,9 +203,26 @@ def color_square(c):
 
 
 # =======================
+# Period selection (dominant period)
+# =======================
+def pick_period(tp_peak, tp_wave, tp_swell):
+    """
+    Kies een 'dominante' periode per uur.
+    Prefer:
+      1) swell_wave_peak_period (dominante swellcomponent)
+      2) wave_period (algemene golfperiode)
+      3) swell_wave_period (gemiddelde swellperiode)
+    """
+    for v in (tp_peak, tp_wave, tp_swell):
+        if v is not None:
+            return v
+    return None
+
+
+# =======================
 # Analyse (de kern)
 # =======================
-def build_day_features(hrs, waves, periods, winds, dirs, date):
+def build_day_features(hrs, waves, t_swell, t_wave, t_peak, winds, dirs, date):
     ids = [
         i for i, ts in enumerate(hrs)
         if ts.startswith(str(date)) and 8 <= int(ts[11:13]) < 20
@@ -191,32 +236,51 @@ def build_day_features(hrs, waves, periods, winds, dirs, date):
         if not ixs:
             continue
         i0 = ixs[0]
-        hw, tp, ws, dr = waves[i0], periods[i0], winds[i0], dirs[i0]
+
+        hw = waves[i0]
+        ws = winds[i0]
+        dr = dirs[i0]
+
+        # dominante periode per uur
+        tp = pick_period(t_peak[i0], t_wave[i0], t_swell[i0])
+
         if None in (hw, tp, ws, dr):
             continue
+
         wt = wind_type_from_dir(dr)
-        hourly[h] = {"wave": hw, "period": tp, "wind": ws, "wind_type": wt}
+        hourly[h] = {
+            "wave": hw,
+            "period": tp,
+            "wind": ws,
+            "wind_type": wt,
+            "t_swell": t_swell[i0],
+            "t_wave": t_wave[i0],
+            "t_peak": t_peak[i0],
+        }
 
     if len(hourly) < 6:
         return None
 
-    waves_h = [hourly[h]["wave"] for h in sorted(hourly)]
-    per_h = [hourly[h]["period"] for h in sorted(hourly)]
-    wind_h = [hourly[h]["wind"] for h in sorted(hourly)]
-    wtype_h = [hourly[h]["wind_type"] for h in sorted(hourly)]
+    hours_sorted = sorted(hourly)
+    waves_h = [hourly[h]["wave"] for h in hours_sorted]
+    per_h = [hourly[h]["period"] for h in hours_sorted]
+    wind_h = [hourly[h]["wind"] for h in hours_sorted]
+    wtype_h = [hourly[h]["wind_type"] for h in hours_sorted]
 
     avg_wave = stats.mean(waves_h)
     avg_per = stats.mean(per_h)
     rep_per = stats.median(per_h)
     avg_wind = stats.mean(wind_h)
 
+    # representatieve windrichting via meerderheid
     day_wt = max(set(wtype_h), key=wtype_h.count)
 
     energy = 0.49 * (avg_wave ** 2) * avg_per
     day_score = score_for_conditions(avg_wave, avg_per, avg_wind, day_wt)
 
+    # clusters op score
     hourly_scores = {}
-    for h in hourly:
+    for h in hours_sorted:
         s = score_for_conditions(hourly[h]["wave"], hourly[h]["period"], hourly[h]["wind"], hourly[h]["wind_type"])
         hourly_scores[h] = s
 
@@ -247,6 +311,7 @@ def build_day_features(hrs, waves, periods, winds, dirs, date):
     def pct(val):
         return round(100 * sum(1 for x in wtype_h if x == val) / len(wtype_h))
 
+    # diagnose
     diag = {
         "wave_min": round(min(waves_h), 2),
         "wave_max": round(max(waves_h), 2),
@@ -262,19 +327,31 @@ def build_day_features(hrs, waves, periods, winds, dirs, date):
         "sideshore_pct": pct("sideshore"),
         "period_spread": round(max(per_h) - min(per_h), 1),
         "wind_spread": round(max(wind_h) - min(wind_h), 1),
+        "spot": SPOT["name"],
+        "note": "Forecast voor Scheveningen; andere apps kunnen kust-breed samenvatten.",
     }
 
     hourly_compact = [
-        {"h": h, "w": round(hourly[h]["wave"], 2), "t": round(hourly[h]["period"], 1),
-         "ws": round(hourly[h]["wind"], 1), "wt": hourly[h]["wind_type"]}
-        for h in sorted(hourly)
+        {
+            "h": h,
+            "w": round(hourly[h]["wave"], 2),
+            "t": round(hourly[h]["period"], 1),
+            "ws": round(hourly[h]["wind"], 1),
+            "wt": hourly[h]["wind_type"],
+            "t_peak": None if hourly[h]["t_peak"] is None else round(hourly[h]["t_peak"], 1),
+            "t_wave": None if hourly[h]["t_wave"] is None else round(hourly[h]["t_wave"], 1),
+            "t_swell": None if hourly[h]["t_swell"] is None else round(hourly[h]["t_swell"], 1),
+        }
+        for h in hours_sorted
     ]
 
+    # dagdelen
     dayparts = {}
     for name, (h0, h1) in DAYPARTS_DEF.items():
         hs = [h for h in range(h0, h1) if h in hourly]
         if not hs:
             continue
+
         pw = [hourly[h]["wave"] for h in hs]
         pt = [hourly[h]["period"] for h in hs]
         pwind = [hourly[h]["wind"] for h in hs]
@@ -284,10 +361,10 @@ def build_day_features(hrs, waves, periods, winds, dirs, date):
         p_per_avg = stats.mean(pt)
         p_per_rep = stats.median(pt)
         p_wind_avg = stats.mean(pwind)
-        p_wt = max(set(pwt), key=pwt.count)
+        p_dir_type = max(set(pwt), key=pwt.count)
 
         p_energy = 0.49 * (p_wave_avg ** 2) * p_per_avg
-        p_score = score_for_conditions(p_wave_avg, p_per_avg, p_wind_avg, p_wt)
+        p_score = score_for_conditions(p_wave_avg, p_per_avg, p_wind_avg, p_dir_type)
         p_color = color_from_score_energy(p_score, p_energy)
         p_color = enforce_period_color(p_color, p_per_rep)
 
@@ -297,8 +374,9 @@ def build_day_features(hrs, waves, periods, winds, dirs, date):
             "h_max": max(pw),
             "t_min": min(pt),
             "t_max": max(pt),
+            "t_rep": p_per_rep,
             "wind_avg": p_wind_avg,
-            "wind_type": p_wt,
+            "wind_type": p_dir_type,
         }
 
     return {
@@ -322,21 +400,38 @@ def build_day_features(hrs, waves, periods, winds, dirs, date):
 def summarize_forecast(marine, wind, days_out=3):
     hrs = marine["hourly"]["time"]
 
-    waves_raw = marine["hourly"]["wave_height"]
-    periods_raw = marine["hourly"]["swell_wave_period"]
-    winds_raw = wind["hourly"]["windspeed_10m"]
-    dirs_raw = wind["hourly"]["winddirection_10m"]
+    waves_raw = marine["hourly"].get("wave_height", [])
+    swell_period_raw = marine["hourly"].get("swell_wave_period", [])
+    wave_period_raw = marine["hourly"].get("wave_period", [])
+    peak_period_raw = marine["hourly"].get("swell_wave_peak_period", [])
 
-    waves = [(h * 1.4) if h is not None else None for h in waves_raw]
-    periods = [(p + 1.0) if p is not None else None for p in periods_raw]
+    winds_raw = wind["hourly"].get("windspeed_10m", [])
+    dirs_raw = wind["hourly"].get("winddirection_10m", [])
+
+    # kalibratie
+    waves = [(h * WAVE_MULT) if h is not None else None for h in waves_raw]
+
+    def _period_adjust(arr):
+        out = []
+        for p in arr:
+            out.append((p + PERIOD_BIAS_S) if p is not None else None)
+        return out
+
+    t_swell = _period_adjust(swell_period_raw)
+    t_wave = _period_adjust(wave_period_raw)
+    t_peak = _period_adjust(peak_period_raw)
+
     winds = [w if w is not None else None for w in winds_raw]
     dirs = [d if d is not None else None for d in dirs_raw]
+
+    if not hrs:
+        return []
 
     start_date = dt.date.fromisoformat(hrs[0][:10])
     out = []
     for d in range(days_out):
         date = start_date + dt.timedelta(days=d)
-        day = build_day_features(hrs, waves, periods, winds, dirs, date)
+        day = build_day_features(hrs, waves, t_swell, t_wave, t_peak, winds, dirs, date)
         if day:
             out.append(day)
     return out
@@ -378,6 +473,7 @@ def best_moments_line(day):
 
     phrase = natural_window_phrase(day)
     if phrase == "vrijwel de hele dag":
+        # dit gaat over spreiding (geen uitgesproken piek), niet automatisch over “kwaliteit”
         return "👉 Beste momenten: de hele dag vrij consistent (08–20u)"
 
     clusters = day.get("clusters") or []
@@ -392,12 +488,14 @@ def best_moments_line(day):
 # AI coach (vaste stijl + data-onderbouwing)
 # =======================
 SYSTEM_COACH = (
-    "Je bent een nuchtere maar enthousiaste Nederlandse surfcoach voor de Noordzee. "
+    f"Je bent een nuchtere maar enthousiaste Nederlandse surfcoach voor {SPOT['name']} (Scheveningen). "
+    "Je baseert je op model-forecast data voor deze spot; andere apps kunnen kust-breed of op metingen samenvatten. "
     "Je bent eerlijk: hoogte alleen maakt het niet goed; wind en periode zijn doorslaggevend. "
     "Je praat als tegen een vaste surfmaat: kort, warm, concreet, zonder hype. "
     "Je benoemt beperkingen en twijfel als het net-aan is. "
+    "Als je over 'venster' praat, bedoel je verdeling over de dag, niet automatisch dat het goed is. "
     "Enthousiasme is verdiend: op groen mag je echt blij zijn. "
-    "Op oranje mag je zeggen dat er 'heerlijke momenten' tussenzitten, maar noem het geen 'heerlijk surfen'. "
+    "Op oranje mag je zeggen dat er 'heerlijke momenten' of 'heerlijke setjes' tussenzitten, maar noem het geen 'heerlijk surfen'. "
     "Op rood ben je duidelijk dat het vooral rommelig/taai is. "
     "Voorbeelden van toon (niet letterlijk kopiëren): "
     "‘Met wat geduld zitten er best bruikbare setjes tussen, al blijft het wisselend.’ "
@@ -405,6 +503,7 @@ SYSTEM_COACH = (
     "‘Hoogte zat, maar de wind drukt het snel plat; vooral werken voor je golven.’ "
     "‘Alles valt redelijk op z’n plek vandaag, mooie kans om meters te maken.’"
 )
+
 
 def _sanitize_coach(text):
     if not text:
@@ -427,12 +526,12 @@ def _sanitize_coach(text):
 def _contains_heerlijk_surfen(text):
     if not text:
         return False
-    # Blokkeer specifiek "heerlijk surfen" (maar laat "heerlijke momenten" met rust)
     return re.search(r"\bheerlij\w*\s+surfen\b", text.lower()) is not None
 
 
 def _ai_coach(day, purpose="today"):
     payload = {
+        "spot": SPOT["name"],
         "stoplicht": day["color"],
         "avg": {
             "wave_m": round(day["avg_wave"], 2),
@@ -470,7 +569,7 @@ def _ai_coach(day, purpose="today"):
             "Je mag 1-2 getallen noemen (hoogte/periode/wind), maar noem geen tijden. "
             "Onderbouw met 2 signalen uit de uurdata (windrichting-aandeel, periode, windsterkte, stabiliteit, piek). "
             "Als stoplicht groen is, mag je echt enthousiast zijn. "
-            "Als stoplicht oranje is, mag je zeggen dat er heerlijke momenten tussenzitten, "
+            "Als stoplicht oranje is, mag je zeggen dat er heerlijke momenten/setjes tussenzitten, "
             "maar noem het geen 'heerlijk surfen'. "
             "Als stoplicht rood is, wees helder dat het rommelig/taai is."
         )
@@ -508,8 +607,7 @@ def _ai_coach(day, purpose="today"):
 
     txt = _sanitize_coach(txt)
 
-    # Mini-guardrail precies zoals jij wil:
-    # "heerlijk surfen" alleen bij groen.
+    # Mini-guardrail: "heerlijk surfen" alleen bij groen.
     if txt and day.get("color") != "🟢" and _contains_heerlijk_surfen(txt):
         return ""
 
@@ -563,8 +661,10 @@ def build_message(summary):
         part = dp.get(name)
         if not part:
             continue
+
         h_txt = fmt_range(part["h_min"], part["h_max"], ndigits=1, unit="m")
-        t_txt = fmt_range(part["t_min"], part["t_max"], ndigits=0, unit="s")
+        t_txt = fmt_period_range_floor_ceil(part["t_min"], part["t_max"], unit="s")
+
         lines.append(
             f"{part['color']} {name}: {h_txt} / {t_txt} ~{round(part['wind_avg'])} km/u {part['wind_type']}"
         )
