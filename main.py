@@ -598,40 +598,90 @@ def _best_cluster(day):
     )[0]
 
 
+def _daypart_blocks(day):
+    """
+    Bouw aaneengesloten blokken van dagdelen met dezelfde kleur.
+    """
+    dp = day.get("dayparts") or {}
+    order = [("Ochtend", 8, 12), ("Middag", 12, 16), ("Avond", 16, 20)]
+    seq = []
+    for name, h0, h1 in order:
+        if name in dp and dp[name].get("color"):
+            seq.append((name, h0, h1, dp[name]["color"]))
+
+    if not seq:
+        return []
+
+    blocks = []
+    cur = {"start": seq[0][1], "end": seq[0][2], "color": seq[0][3]}
+    for _, h0, h1, c in seq[1:]:
+        if c == cur["color"] and h0 == cur["end"]:
+            cur["end"] = h1
+        else:
+            blocks.append(cur)
+            cur = {"start": h0, "end": h1, "color": c}
+    blocks.append(cur)
+    return blocks
+
+
+def _best_daypart_block(day):
+    """
+    Kies beste blok obv dagdelen:
+    - Als er groen is: pak het langste GROENE blok (beste surfstuk)
+    - Anders: pak het langste ORANJE blok
+    - Rood: geen echt venster (wordt elders afgevangen bij korte periode)
+    """
+    blocks = _daypart_blocks(day)
+    if not blocks:
+        return None
+
+    colors = [b["color"] for b in blocks]
+    if "🟢" in colors:
+        candidates = [b for b in blocks if b["color"] == "🟢"]
+    elif "🟠" in colors:
+        candidates = [b for b in blocks if b["color"] == "🟠"]
+    else:
+        return None
+
+    # langste blok wint; bij gelijk: vroegste
+    candidates = sorted(candidates, key=lambda b: ((b["end"] - b["start"]), -b["start"]), reverse=True)
+    return candidates[0]
+
+
 def _is_truly_all_day(day):
     """
     Alleen 'hele dag' als:
-    - grootste cluster lang is (>= 8 uur aaneengesloten)
-    - én dagdelen niet gemixt zijn (geen groen + rood combinatie)
+    - alle dagdelen dezelfde kleur hebben
+    - én het langste cluster lang is (>= 8 uur)
     """
     dp = day.get("dayparts") or {}
     colors = [v.get("color") for v in dp.values() if v.get("color")]
-    if not colors:
+    if len(colors) < 2:
         return False
-
-    has_green = any(c == "🟢" for c in colors)
-    has_red = any(c == "🔴" for c in colors)
-
-    # Als zowel groen als rood voorkomt: nooit 'hele dag'
-    if has_green and has_red:
+    if len(set(colors)) != 1:
         return False
 
     clusters = day.get("clusters") or []
     if not clusters:
         return False
-
     longest_len = max((c["end"] - c["start"]) for c in clusters)
     return longest_len >= 8
 
 
 def natural_window_phrase(day):
+    # Als er een duidelijk groen/oranje dagdeel-blok is, gebruik dat als venster-taal
+    b = _best_daypart_block(day)
+    if b:
+        if _is_truly_all_day(day):
+            return "vrijwel de hele dag"
+        return f"vooral {b['start']:02d}–{b['end']:02d}u"
+
+    # fallback: clusters
     bc = _best_cluster(day)
     if not bc:
         return "geen duidelijk venster"
-
     if _is_truly_all_day(day):
         return "vrijwel de hele dag"
-
     return f"vooral {bc['start']:02d}–{bc['end']:02d}u"
 
 
@@ -639,6 +689,14 @@ def best_moments_line(day):
     if period_is_short(day.get("rep_per", day.get("avg_per"))):
         return "👉 Beste moment: geen echt venster (te korte periode, vooral rommel)"
 
+    # Als er groen (of oranje) als duidelijk beste blok is, gebruik dat.
+    b = _best_daypart_block(day)
+    if b:
+        if _is_truly_all_day(day) and day.get("color") == "🟢":
+            return "👉 Beste momenten: de hele dag vrij consistent (08–20u)"
+        return f"👉 Beste moment: {b['start']:02d}–{b['end']:02d}u"
+
+    # fallback: clusters
     bc = _best_cluster(day)
     if not bc:
         return "👉 Beste moment: geen duidelijk venster vandaag"
@@ -647,7 +705,7 @@ def best_moments_line(day):
         return "👉 Beste momenten: de hele dag vrij consistent (08–20u)"
 
     return f"👉 Beste moment: {bc['start']:02d}–{bc['end']:02d}u"
-
+    
 # =======================
 # 1-oogopslag: overall kleur highlight (optioneel groen als er groen moment is)
 # =======================
