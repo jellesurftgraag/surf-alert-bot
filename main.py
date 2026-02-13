@@ -36,19 +36,50 @@ PERIOD_ORANGE_MIN_S = 6
 WAVE_MULT = 1.4
 PERIOD_BIAS_S = 1.0
 
-# Stabiliteit voor getoonde ranges
+# Stabiliteit voor getoonde ranges (trim)
 PERIOD_Q_LO = 0.20
 PERIOD_Q_HI = 0.80
 
+# Als getoonde periode-band te breed wordt, toon "~median (wisselend)"
+PERIOD_MAX_SPREAD_FOR_BAND = 4.0
 
 # =======================
-# Network helpers (FIX: retries)
+# Run-window / verzending (08:00 NL tijd)
+# =======================
+SEND_AT_HOUR = 8
+SEND_AT_MINUTE = 0
+
+
+# =======================
+# Time helpers
+# =======================
+def _tz_now_amsterdam():
+    """
+    Werkt zonder externe libs. TZ in Open-Meteo zit goed; voor scheduling is lokaal oké.
+    Als je server niet in NL draait, zet TZ via env (bijv. in cron) of installeer zoneinfo usage.
+    """
+    return dt.datetime.now()
+
+
+def wait_until_send_time(hour=SEND_AT_HOUR, minute=SEND_AT_MINUTE):
+    """
+    Als je dit script continu runt (bijv. systemd), wacht het tot 08:00 en stuurt dan.
+    Als je cron gebruikt, zet je cron op 08:00 en is dit niet nodig (maar kan geen kwaad: het wacht dan 0 sec).
+    """
+    now = _tz_now_amsterdam()
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if now > target:
+        # Als je het later op de dag runt: stuur direct (geen wachten tot morgen)
+        return
+    delta = (target - now).total_seconds()
+    if delta > 0:
+        time.sleep(delta)
+
+
+# =======================
+# Network helpers (retries)
 # =======================
 def _safe_get_json(url, params, *, timeout=20, retries=3, backoff_s=2):
-    """
-    Betrouwbare GET voor Open-Meteo: retries + lineaire backoff.
-    Dit verandert je surfoutput niet, alleen de stabiliteit.
-    """
     last_err = None
     for attempt in range(retries):
         try:
@@ -135,9 +166,6 @@ def quantile(values, q):
 
 
 def robust_band(values, q_lo=PERIOD_Q_LO, q_hi=PERIOD_Q_HI):
-    """
-    Trimmed band om uitschieters te dempen.
-    """
     if not values:
         return (None, None)
     lo = quantile(values, q_lo)
@@ -148,10 +176,6 @@ def robust_band(values, q_lo=PERIOD_Q_LO, q_hi=PERIOD_Q_HI):
 
 
 def trend_label(values):
-    """
-    Heel simpele trend detectie:
-    eerste helft vs tweede helft median.
-    """
     if not values or len(values) < 6:
         return "onzeker"
     mid = len(values) // 2
@@ -183,15 +207,27 @@ def fmt_range(lo, hi, ndigits=0, unit=""):
     return f"{lo_r:.{ndigits}f}–{hi_r:.{ndigits}f}{(' ' + unit) if unit else ''}"
 
 
-def fmt_period_band(lo, hi, unit="s"):
+def fmt_period_band(lo, hi, unit="s", median=None):
     """
-    Perioden tonen als integers, maar robuust:
-    lo floor, hi ceil, zodat 5.2–6.1 wordt 5–7 (eerlijker rond grenzen).
+    - Normaal: integer band (floor/ceil).
+    - Als band te breed wordt: "~median s (wisselend)".
     """
     if lo is None or hi is None:
         return ""
-    lo_i = int(math.floor(float(lo)))
-    hi_i = int(math.ceil(float(hi)))
+    lo_f = float(lo)
+    hi_f = float(hi)
+    spread = hi_f - lo_f
+
+    if spread > PERIOD_MAX_SPREAD_FOR_BAND:
+        if median is None:
+            m = (lo_f + hi_f) / 2.0
+        else:
+            m = float(median)
+        m_i = int(round(m))
+        return f"~{m_i} {unit} (wisselend)"
+
+    lo_i = int(math.floor(lo_f))
+    hi_i = int(math.ceil(hi_f))
     if lo_i == hi_i:
         return f"{lo_i} {unit}"
     return f"{lo_i}–{hi_i} {unit}"
@@ -277,16 +313,22 @@ def color_square(c):
     return {"🟢": "🟩", "🟠": "🟧", "🔴": "🟥"}.get(c, "🟧")
 
 
+def cap_color_for_wind(color, wind_type, wind_kmh):
+    """
+    Alleen caps op kleurweergave, niet op de onderliggende score.
+    """
+    if wind_type == "onshore":
+        if wind_kmh >= 35:
+            return "🔴"
+        if wind_kmh >= 28 and color == "🟢":
+            return "🟠"
+    return color
+
+
 # =======================
-# Period choice per hour (met kwaliteit)
+# Period choice per hour
 # =======================
 def choose_period_hour(t_peak, t_wave, t_swell):
-    """
-    Per uur kiezen we een periode:
-    1) peak, maar alleen als niet absurd afwijkt van wave/swell
-    2) wave
-    3) swell
-    """
     candidates = []
     if t_peak is not None:
         candidates.append(("peak", t_peak))
@@ -345,9 +387,6 @@ def build_day_features(hrs, waves, t_swell, t_wave, t_peak, winds, dirs, date):
             "wind_type": wt,
             "period": tp,
             "period_src": src,
-            "t_peak": t_peak[i0],
-            "t_wave": t_wave[i0],
-            "t_swell": t_swell[i0],
         }
 
     if len(hourly) < 6:
@@ -369,6 +408,7 @@ def build_day_features(hrs, waves, t_swell, t_wave, t_peak, winds, dirs, date):
     energy = 0.49 * (avg_wave ** 2) * avg_per
     day_score = score_for_conditions(avg_wave, avg_per, avg_wind, day_wt)
 
+    # clusters
     hourly_scores = {
         h: score_for_conditions(hourly[h]["wave"], hourly[h]["period"], hourly[h]["wind"], hourly[h]["wind_type"])
         for h in hours_sorted
@@ -406,7 +446,6 @@ def build_day_features(hrs, waves, t_swell, t_wave, t_peak, winds, dirs, date):
 
     diag = {
         "spot": SPOT["name"],
-        "note": "Forecast voor Scheveningen; andere apps kunnen kust-breed of op metingen samenvatten.",
         "period_src_mode": src_mode,
         "period_trend": trend_label(per_h),
         "wave_min": round(min(waves_h), 2),
@@ -437,6 +476,7 @@ def build_day_features(hrs, waves, t_swell, t_wave, t_peak, winds, dirs, date):
         for h in hours_sorted
     ]
 
+    # dagdelen
     dayparts = {}
     for name, (h0, h1) in DAYPARTS_DEF.items():
         hs = [h for h in range(h0, h1) if h in hourly]
@@ -459,6 +499,10 @@ def build_day_features(hrs, waves, t_swell, t_wave, t_peak, winds, dirs, date):
         p_color = color_from_score_energy(p_score, p_energy)
         p_color = enforce_period_color(p_color, p_per_rep)
 
+        # visuele cap bij harde onshore
+        p_color = cap_color_for_wind(p_color, p_dir_type, p_wind_avg)
+
+        # robuuste band voor periode
         t_lo, t_hi = robust_band(pt, PERIOD_Q_LO, PERIOD_Q_HI)
 
         dayparts[name] = {
@@ -491,15 +535,17 @@ def build_day_features(hrs, waves, t_swell, t_wave, t_peak, winds, dirs, date):
 
 
 def summarize_forecast(marine, wind, days_out=3):
-    hrs = marine["hourly"]["time"]
+    hrs = marine.get("hourly", {}).get("time", [])
+    if not hrs:
+        return []
 
-    waves_raw = marine["hourly"].get("wave_height", [])
-    swell_period_raw = marine["hourly"].get("swell_wave_period", [])
-    wave_period_raw = marine["hourly"].get("wave_period", [])
-    peak_period_raw = marine["hourly"].get("swell_wave_peak_period", [])
+    waves_raw = marine.get("hourly", {}).get("wave_height", [])
+    swell_period_raw = marine.get("hourly", {}).get("swell_wave_period", [])
+    wave_period_raw = marine.get("hourly", {}).get("wave_period", [])
+    peak_period_raw = marine.get("hourly", {}).get("swell_wave_peak_period", [])
 
-    winds_raw = wind["hourly"].get("windspeed_10m", [])
-    dirs_raw = wind["hourly"].get("winddirection_10m", [])
+    winds_raw = wind.get("hourly", {}).get("windspeed_10m", [])
+    dirs_raw = wind.get("hourly", {}).get("winddirection_10m", [])
 
     waves = [(h * WAVE_MULT) if h is not None else None for h in waves_raw]
 
@@ -513,8 +559,20 @@ def summarize_forecast(marine, wind, days_out=3):
     winds = [w if w is not None else None for w in winds_raw]
     dirs = [d if d is not None else None for d in dirs_raw]
 
-    if not hrs:
-        return []
+    # guard: arrays kunnen soms korter zijn, pad met None
+    n = len(hrs)
+
+    def pad(arr):
+        if len(arr) >= n:
+            return arr[:n]
+        return arr + [None] * (n - len(arr))
+
+    waves = pad(waves)
+    t_swell = pad(t_swell)
+    t_wave = pad(t_wave)
+    t_peak = pad(t_peak)
+    winds = pad(winds)
+    dirs = pad(dirs)
 
     start_date = dt.date.fromisoformat(hrs[0][:10])
     out = []
@@ -562,7 +620,9 @@ def best_moments_line(day):
 
     phrase = natural_window_phrase(day)
     if phrase == "vrijwel de hele dag":
-        return "👉 Beste momenten: de hele dag vrij consistent (08–20u)"
+        if day.get("color") == "🟢":
+            return "👉 Beste momenten: de hele dag vrij consistent (08–20u)"
+        return "👉 Beste momenten: door de dag heen, met duidelijk betere stukken"
 
     clusters = day.get("clusters") or []
     if not clusters:
@@ -570,6 +630,50 @@ def best_moments_line(day):
 
     top = sorted(clusters, key=lambda c: (c["score"], (c["end"] - c["start"])), reverse=True)[0]
     return f"👉 Beste moment: {top['start']:02d}–{top['end']:02d}u"
+
+
+# =======================
+# 1-oogopslag: overall kleur highlight (optioneel groen als er groen moment is)
+# =======================
+def pick_header_color(day):
+    """
+    Jij vroeg: als er een groen moment is, wil je dat in 1 oogopslag zien.
+    Zonder je hele systeem om te gooien:
+    - Als day.color 🟢 -> 🟢
+    - Als day.color 🟠 maar er is minimaal 1 dagdeel 🟢 -> header 🟢 (highlight)
+    - Als day.color 🔴 -> 🔴 (blijft rood)
+    """
+    if day.get("color") == "🟢":
+        return "🟢"
+    if day.get("color") == "🟠":
+        dp = day.get("dayparts") or {}
+        if any(v.get("color") == "🟢" for v in dp.values()):
+            return "🟢"
+    return day.get("color", "🟠")
+
+
+def why_tag(day):
+    d = day.get("diag", {})
+    wt = day.get("wind_type", "")
+    wind = d.get("wind_med", None)
+    per = d.get("period_med", None)
+
+    bits = []
+    if wt:
+        bits.append(wt)
+    if wind is not None:
+        if wind >= 30:
+            bits.append("veel wind")
+        elif wind <= 10:
+            bits.append("weinig wind")
+    if per is not None:
+        if per < 6:
+            bits.append("korte periode")
+        elif per >= 8:
+            bits.append("lange periode")
+
+    bits = bits[:2]
+    return " (" + " + ".join(bits) + ")" if bits else ""
 
 
 # =======================
@@ -614,6 +718,7 @@ def _ai_coach(day, purpose="today"):
     payload = {
         "spot": SPOT["name"],
         "stoplicht": day["color"],
+        "header_hint": pick_header_color(day),  # extra hint voor toon
         "avg": {
             "wave_m": round(day["avg_wave"], 2),
             "period_s": round(day["avg_per"], 1),
@@ -628,8 +733,11 @@ def _ai_coach(day, purpose="today"):
                 "color": v["color"],
                 "wave_min": round(v["h_min"], 2),
                 "wave_max": round(v["h_max"], 2),
-                "period_min": round(v["t_min"], 1) if v["t_min"] is not None else None,
-                "period_max": round(v["t_max"], 1) if v["t_max"] is not None else None,
+                "period_med": round(v["t_rep"], 1) if v.get("t_rep") is not None else None,
+                "period_band": [
+                    round(v["t_min"], 1) if v.get("t_min") is not None else None,
+                    round(v["t_max"], 1) if v.get("t_max") is not None else None,
+                ],
                 "wind_avg": round(v["wind_avg"], 1),
                 "wind_type": v["wind_type"],
             }
@@ -643,7 +751,8 @@ def _ai_coach(day, purpose="today"):
             "Schrijf 1 korte, menselijke surfcoach-zin (10-18 woorden) voor morgen/overmorgen. "
             "Je mag 1-2 getallen noemen (hoogte/periode/wind), maar noem geen tijden. "
             "Onderbouw met 2 signalen uit de data (windrichting-aandeel, periode-trend, windsterkte, stabiliteit, piek). "
-            "Pas je enthousiasme aan op stoplicht (groen blij, oranje genuanceerd, rood duidelijk)."
+            "Pas je enthousiasme aan op stoplicht (groen blij, oranje genuanceerd, rood duidelijk). "
+            "Vermijd vage woorden zonder onderbouwing."
         )
     else:
         instruction = (
@@ -653,7 +762,8 @@ def _ai_coach(day, purpose="today"):
             "Als stoplicht groen is, mag je echt enthousiast zijn. "
             "Als stoplicht oranje is, mag je zeggen dat er heerlijke momenten of setjes tussenzitten, "
             "maar noem het geen heerlijk surfen. "
-            "Als stoplicht rood is, wees helder dat het rommelig of taai is."
+            "Als stoplicht rood is, wees helder dat het rommelig of taai is. "
+            "Vermijd 'hele dag goed' taal tenzij stoplicht groen is."
         )
 
     body = json.dumps(
@@ -731,9 +841,11 @@ def build_message(summary):
     d = today["date"]
     label = f"{DAGEN[d.weekday()]} {d.day} {MAANDEN[d.month-1]}"
 
+    header_color = pick_header_color(today)
+
     lines = []
     lines.append(f"📅 {label}")
-    lines.append(f"{color_square(today['color'])} {coach_line(today, 'today')}")
+    lines.append(f"{color_square(header_color)} {coach_line(today, 'today')}{why_tag(today)}")
     lines.append("")
 
     dp = today.get("dayparts") or {}
@@ -743,8 +855,7 @@ def build_message(summary):
             continue
 
         h_txt = fmt_range(part["h_min"], part["h_max"], ndigits=1, unit="m")
-        t_txt = fmt_period_band(part["t_min"], part["t_max"], unit="s")
-
+        t_txt = fmt_period_band(part["t_min"], part["t_max"], unit="s", median=part.get("t_rep"))
         lines.append(
             f"{part['color']} {name}: {h_txt} / {t_txt} ~{round(part['wind_avg'])} km/u {part['wind_type']}"
         )
@@ -756,6 +867,8 @@ def build_message(summary):
     if len(summary) > 1:
         t = summary[1]
         phrase = natural_window_phrase(t)
+        if phrase == "vrijwel de hele dag" and t.get("color") != "🟢":
+            phrase = "door de dag heen (met dips)"
         lines.append(
             f"{color_square(t['color'])} Morgen: {coach_line(t, 'future')} "
             f"Venster: {phrase}, met ~{t['avg_wave']:.1f} m en {round(t['avg_per'])} s swell."
@@ -764,6 +877,8 @@ def build_message(summary):
     if len(summary) > 2:
         o = summary[2]
         phrase = natural_window_phrase(o)
+        if phrase == "vrijwel de hele dag" and o.get("color") != "🟢":
+            phrase = "door de dag heen (met dips)"
         lines.append(
             f"{color_square(o['color'])} Overmorgen: {coach_line(o, 'future')} "
             f"Venster: {phrase}, met ~{o['avg_wave']:.1f} m en {round(o['avg_per'])} s swell."
@@ -798,9 +913,14 @@ def send_telegram_message(text):
 
 
 # =======================
-# Main (FIX: never crash silently)
+# Main
 # =======================
 if __name__ == "__main__":
+    # Belangrijk:
+    # - Als je cron gebruikt: zet cron op 08:00 en laat onderstaande wait staan (wacht dan 0 sec).
+    # - Als je script continu draait: dit zorgt dat hij om 08:00 verstuurt.
+    wait_until_send_time(SEND_AT_HOUR, SEND_AT_MINUTE)
+
     try:
         marine, wind = get_open_meteo(SPOT["lat"], SPOT["lon"], days=2)
         summary = summarize_forecast(marine, wind, days_out=3)
@@ -817,5 +937,4 @@ if __name__ == "__main__":
     print(message)
     print("----- SURF MESSAGE END -----")
 
-    # altijd proberen te sturen
     send_telegram_message(message)
