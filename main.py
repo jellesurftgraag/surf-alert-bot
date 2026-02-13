@@ -587,50 +587,66 @@ def summarize_forecast(marine, wind, days_out=3):
 # =======================
 # Venster tekst
 # =======================
-def natural_window_phrase(day, nearly_all_day_hours=9):
+def _best_cluster(day):
     clusters = day.get("clusters") or []
     if not clusters:
+        return None
+    return sorted(
+        clusters,
+        key=lambda c: (c["score"], (c["end"] - c["start"])),
+        reverse=True,
+    )[0]
+
+
+def _is_truly_all_day(day):
+    """
+    Alleen 'hele dag' als:
+    - grootste cluster lang is (>= 8 uur aaneengesloten)
+    - én dagdelen niet gemixt zijn (geen groen + rood combinatie)
+    """
+    dp = day.get("dayparts") or {}
+    colors = [v.get("color") for v in dp.values() if v.get("color")]
+    if not colors:
+        return False
+
+    has_green = any(c == "🟢" for c in colors)
+    has_red = any(c == "🔴" for c in colors)
+
+    # Als zowel groen als rood voorkomt: nooit 'hele dag'
+    if has_green and has_red:
+        return False
+
+    clusters = day.get("clusters") or []
+    if not clusters:
+        return False
+
+    longest_len = max((c["end"] - c["start"]) for c in clusters)
+    return longest_len >= 8
+
+
+def natural_window_phrase(day):
+    bc = _best_cluster(day)
+    if not bc:
         return "geen duidelijk venster"
 
-    covered = set()
-    for c in clusters:
-        covered.update(range(c["start"], c["end"]))
-    total = len(covered)
-
-    clusters_sorted = sorted(clusters, key=lambda c: ((c["end"] - c["start"]), c["score"]), reverse=True)
-    main = clusters_sorted[0]
-
-    if total >= nearly_all_day_hours:
+    if _is_truly_all_day(day):
         return "vrijwel de hele dag"
 
-    phrase = f"vooral {main['start']:02d}–{main['end']:02d}u"
-    if len(clusters_sorted) > 1:
-        second = clusters_sorted[1]
-        if second["score"] >= 0.85 * main["score"]:
-            if second["start"] >= main["end"]:
-                phrase += f", later nog {second['start']:02d}–{second['end']:02d}u"
-            else:
-                phrase += f" en ook {second['start']:02d}–{second['end']:02d}u"
-    return phrase
+    return f"vooral {bc['start']:02d}–{bc['end']:02d}u"
 
 
 def best_moments_line(day):
     if period_is_short(day.get("rep_per", day.get("avg_per"))):
         return "👉 Beste moment: geen echt venster (te korte periode, vooral rommel)"
 
-    phrase = natural_window_phrase(day)
-    if phrase == "vrijwel de hele dag":
-        if day.get("color") == "🟢":
-            return "👉 Beste momenten: de hele dag vrij consistent (08–20u)"
-        return "👉 Beste momenten: door de dag heen, met duidelijk betere stukken"
-
-    clusters = day.get("clusters") or []
-    if not clusters:
+    bc = _best_cluster(day)
+    if not bc:
         return "👉 Beste moment: geen duidelijk venster vandaag"
 
-    top = sorted(clusters, key=lambda c: (c["score"], (c["end"] - c["start"])), reverse=True)[0]
-    return f"👉 Beste moment: {top['start']:02d}–{top['end']:02d}u"
+    if _is_truly_all_day(day) and day.get("color") == "🟢":
+        return "👉 Beste momenten: de hele dag vrij consistent (08–20u)"
 
+    return f"👉 Beste moment: {bc['start']:02d}–{bc['end']:02d}u"
 
 # =======================
 # 1-oogopslag: overall kleur highlight (optioneel groen als er groen moment is)
