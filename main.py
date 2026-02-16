@@ -51,25 +51,29 @@ SEND_AT_MINUTE = 0
 
 
 # =======================
-# Time helpers
+# Time helpers (Amsterdam-aware)
 # =======================
 def _tz_now_amsterdam():
     """
-    Werkt zonder externe libs. TZ in Open-Meteo zit goed; voor scheduling is lokaal oké.
-    Als je server niet in NL draait, zet TZ via env (bijv. in cron) of installeer zoneinfo usage.
+    Probeert timezone-aware te zijn met zoneinfo (Python 3.9+).
+    Als dat niet kan, valt hij terug op lokale systeemtijd.
     """
-    return dt.datetime.now()
+    try:
+        from zoneinfo import ZoneInfo  # type: ignore
+        return dt.datetime.now(ZoneInfo(TZ))
+    except Exception:
+        return dt.datetime.now()
 
 
 def wait_until_send_time(hour=SEND_AT_HOUR, minute=SEND_AT_MINUTE):
     """
-    Als je dit script continu runt (bijv. systemd), wacht het tot 08:00 en stuurt dan.
-    Als je cron gebruikt, zet je cron op 08:00 en is dit niet nodig (maar kan geen kwaad: het wacht dan 0 sec).
+    Als je dit script continu runt (systemd), wacht het tot 08:00 (NL) en stuurt dan.
+    Als je cron gebruikt: zet cron op 08:00 en deze wacht dan ~0 sec.
     """
     now = _tz_now_amsterdam()
     target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if now > target:
-        # Als je het later op de dag runt: stuur direct (geen wachten tot morgen)
+        # Later op de dag gestart: stuur direct (niet wachten tot morgen)
         return
     delta = (target - now).total_seconds()
     if delta > 0:
@@ -219,10 +223,7 @@ def fmt_period_band(lo, hi, unit="s", median=None):
     spread = hi_f - lo_f
 
     if spread > PERIOD_MAX_SPREAD_FOR_BAND:
-        if median is None:
-            m = (lo_f + hi_f) / 2.0
-        else:
-            m = float(median)
+        m = float(median) if median is not None else (lo_f + hi_f) / 2.0
         m_i = int(round(m))
         return f"~{m_i} {unit} (wisselend)"
 
@@ -408,12 +409,20 @@ def build_day_features(hrs, waves, t_swell, t_wave, t_peak, winds, dirs, date):
     energy = 0.49 * (avg_wave ** 2) * avg_per
     day_score = score_for_conditions(avg_wave, avg_per, avg_wind, day_wt)
 
-    # clusters
+    # hourly_scores (BELANGRIJK: deze gebruiken we voor precieze vensters)
     hourly_scores = {
-        h: score_for_conditions(hourly[h]["wave"], hourly[h]["period"], hourly[h]["wind"], hourly[h]["wind_type"])
+        int(h): float(
+            score_for_conditions(
+                hourly[h]["wave"],
+                hourly[h]["period"],
+                hourly[h]["wind"],
+                hourly[h]["wind_type"],
+            )
+        )
         for h in hours_sorted
     }
 
+    # clusters (uren boven drempel)
     base_thr = 1.0
     rel_thr = 0.7 * max(day_score, 0.0001)
     thr = max(base_thr, rel_thr)
@@ -462,6 +471,8 @@ def build_day_features(hrs, waves, t_swell, t_wave, t_peak, winds, dirs, date):
         "sideshore_pct": pct("sideshore"),
         "period_spread": round(max(per_h) - min(per_h), 1),
         "wind_spread": round(max(wind_h) - min(wind_h), 1),
+        "thr": round(thr, 2),
+        "good_hours_count": len(good_hours),
     }
 
     hourly_compact = [
@@ -531,6 +542,7 @@ def build_day_features(hrs, waves, t_swell, t_wave, t_peak, winds, dirs, date):
         "dayparts": dayparts,
         "diag": diag,
         "hourly_compact": hourly_compact,
+        "hourly_scores": hourly_scores,  # <-- NIEUW: nodig voor precieze vensters
     }
 
 
@@ -585,137 +597,136 @@ def summarize_forecast(marine, wind, days_out=3):
 
 
 # =======================
-# Venster tekst
+# Venster tekst (PRECIES uit uurdata)
 # =======================
-def _best_cluster(day):
-    clusters = day.get("clusters") or []
-    if not clusters:
+def _best_precise_window_from_hours(day, ratio=0.92, min_len=2):
+    """
+    Precies venster op uurniveau:
+    - pak alle uren >= max(ratio * best_uur, 1.0)
+    - kies langste aaneengesloten blok
+    - als < min_len: treat as spike (1 uur)
+    """
+    hscores = day.get("hourly_scores") or {}
+    if not hscores:
         return None
-    return sorted(
-        clusters,
-        key=lambda c: (c["score"], (c["end"] - c["start"])),
-        reverse=True,
-    )[0]
 
+    items = sorted((int(h), float(s)) for h, s in hscores.items() if 8 <= int(h) <= 19)
+    if not items:
+        return None
 
-def _daypart_blocks(day):
-    """
-    Bouw aaneengesloten blokken van dagdelen met dezelfde kleur.
-    """
-    dp = day.get("dayparts") or {}
-    order = [("Ochtend", 8, 12), ("Middag", 12, 16), ("Avond", 16, 20)]
-    seq = []
-    for name, h0, h1 in order:
-        if name in dp and dp[name].get("color"):
-            seq.append((name, h0, h1, dp[name]["color"]))
+    max_s = max(s for _, s in items)
+    if max_s <= 0:
+        return None
 
-    if not seq:
-        return []
+    thr = max(1.0, ratio * max_s)
+    good = [h for h, s in items if s >= thr]
+    if not good:
+        return None
 
-    blocks = []
-    cur = {"start": seq[0][1], "end": seq[0][2], "color": seq[0][3]}
-    for _, h0, h1, c in seq[1:]:
-        if c == cur["color"] and h0 == cur["end"]:
-            cur["end"] = h1
+    best = None
+    start = prev = good[0]
+    for h in good[1:]:
+        if h == prev + 1:
+            prev = h
         else:
-            blocks.append(cur)
-            cur = {"start": h0, "end": h1, "color": c}
-    blocks.append(cur)
-    return blocks
+            block = (start, prev + 1)
+            if best is None or (block[1] - block[0]) > (best[1] - best[0]):
+                best = block
+            start = prev = h
+    block = (start, prev + 1)
+    if best is None or (block[1] - block[0]) > (best[1] - best[0]):
+        best = block
 
+    length = best[1] - best[0]
+    if length < min_len:
+        # spike: beste uur
+        best_hour = max(items, key=lambda x: x[1])[0]
+        return (best_hour, best_hour + 1, True)
 
-def _best_daypart_block(day):
-    """
-    Kies beste blok obv dagdelen:
-    - Als er groen is: pak het langste GROENE blok (beste surfstuk)
-    - Anders: pak het langste ORANJE blok
-    - Rood: geen echt venster (wordt elders afgevangen bij korte periode)
-    """
-    blocks = _daypart_blocks(day)
-    if not blocks:
-        return None
-
-    colors = [b["color"] for b in blocks]
-    if "🟢" in colors:
-        candidates = [b for b in blocks if b["color"] == "🟢"]
-    elif "🟠" in colors:
-        candidates = [b for b in blocks if b["color"] == "🟠"]
-    else:
-        return None
-
-    # langste blok wint; bij gelijk: vroegste
-    candidates = sorted(candidates, key=lambda b: ((b["end"] - b["start"]), -b["start"]), reverse=True)
-    return candidates[0]
+    return (best[0], best[1], False)
 
 
 def _is_truly_all_day(day):
     """
-    Alleen 'hele dag' als:
-    - alle dagdelen dezelfde kleur hebben
-    - én het langste cluster lang is (>= 8 uur)
+    Alleen 'vrijwel de hele dag' als:
+    - clusters/uren echt lang doorlopen (>= 9 uur binnen 08-20)
     """
-    dp = day.get("dayparts") or {}
-    colors = [v.get("color") for v in dp.values() if v.get("color")]
-    if len(colors) < 2:
-        return False
-    if len(set(colors)) != 1:
-        return False
-
     clusters = day.get("clusters") or []
-    if not clusters:
-        return False
-    longest_len = max((c["end"] - c["start"]) for c in clusters)
-    return longest_len >= 8
+    if clusters:
+        covered = set()
+        for c in clusters:
+            covered.update(range(int(c["start"]), int(c["end"])))
+        if len(covered) >= 9:
+            return True
+
+    # fallback: precieze window heel lang
+    best = _best_precise_window_from_hours(day, ratio=0.92, min_len=2)
+    if best:
+        h0, h1, _ = best
+        if (h1 - h0) >= 10:
+            return True
+    return False
 
 
 def natural_window_phrase(day):
-    # Als er een duidelijk groen/oranje dagdeel-blok is, gebruik dat als venster-taal
-    b = _best_daypart_block(day)
-    if b:
-        if _is_truly_all_day(day):
-            return "vrijwel de hele dag"
-        return f"vooral {b['start']:02d}–{b['end']:02d}u"
-
-    # fallback: clusters
-    bc = _best_cluster(day)
-    if not bc:
+    clusters = day.get("clusters") or []
+    if not clusters:
         return "geen duidelijk venster"
+
     if _is_truly_all_day(day):
         return "vrijwel de hele dag"
-    return f"vooral {bc['start']:02d}–{bc['end']:02d}u"
+
+    best = _best_precise_window_from_hours(day, ratio=0.92, min_len=2)
+    if best:
+        h0, h1, is_spike = best
+        length = h1 - h0
+        if is_spike:
+            return f"kort piekje rond {h0:02d}–{h1:02d}u"
+        # als het lang is maar niet “all day”, klinkt dit menselijker dan “haha hele dag”
+        if length >= 7:
+            return f"groot deel van de dag, vooral {h0:02d}–{h1:02d}u"
+        return f"vooral {h0:02d}–{h1:02d}u"
+
+    # fallback: beste cluster
+    top = sorted(clusters, key=lambda c: (c["score"], (c["end"] - c["start"])), reverse=True)[0]
+    return f"vooral {top['start']:02d}–{top['end']:02d}u"
 
 
 def best_moments_line(day):
     if period_is_short(day.get("rep_per", day.get("avg_per"))):
         return "👉 Beste moment: geen echt venster (te korte periode, vooral rommel)"
 
-    # Als er groen (of oranje) als duidelijk beste blok is, gebruik dat.
-    b = _best_daypart_block(day)
-    if b:
-        if _is_truly_all_day(day) and day.get("color") == "🟢":
+    if _is_truly_all_day(day):
+        if day.get("color") == "🟢":
             return "👉 Beste momenten: de hele dag vrij consistent (08–20u)"
-        return f"👉 Beste moment: {b['start']:02d}–{b['end']:02d}u"
+        return "👉 Beste momenten: door de dag heen, met duidelijk betere stukken"
 
-    # fallback: clusters
-    bc = _best_cluster(day)
-    if not bc:
+    best = _best_precise_window_from_hours(day, ratio=0.92, min_len=2)
+    if best:
+        h0, h1, is_spike = best
+        length = h1 - h0
+        if is_spike:
+            return f"👉 Beste moment: kort piekje {h0:02d}–{h1:02d}u"
+        if length >= 7:
+            return f"👉 Beste momenten: groot deel van de dag ({h0:02d}–{h1:02d}u)"
+        return f"👉 Beste moment: {h0:02d}–{h1:02d}u"
+
+    clusters = day.get("clusters") or []
+    if not clusters:
         return "👉 Beste moment: geen duidelijk venster vandaag"
 
-    if _is_truly_all_day(day) and day.get("color") == "🟢":
-        return "👉 Beste momenten: de hele dag vrij consistent (08–20u)"
+    top = sorted(clusters, key=lambda c: (c["score"], (c["end"] - c["start"])), reverse=True)[0]
+    return f"👉 Beste moment: {top['start']:02d}–{top['end']:02d}u"
 
-    return f"👉 Beste moment: {bc['start']:02d}–{bc['end']:02d}u"
-    
+
 # =======================
 # 1-oogopslag: overall kleur highlight (optioneel groen als er groen moment is)
 # =======================
 def pick_header_color(day):
     """
-    Jij vroeg: als er een groen moment is, wil je dat in 1 oogopslag zien.
-    Zonder je hele systeem om te gooien:
     - Als day.color 🟢 -> 🟢
     - Als day.color 🟠 maar er is minimaal 1 dagdeel 🟢 -> header 🟢 (highlight)
-    - Als day.color 🔴 -> 🔴 (blijft rood)
+    - Als day.color 🔴 -> 🔴
     """
     if day.get("color") == "🟢":
         return "🟢"
@@ -792,7 +803,7 @@ def _ai_coach(day, purpose="today"):
     payload = {
         "spot": SPOT["name"],
         "stoplicht": day["color"],
-        "header_hint": pick_header_color(day),  # extra hint voor toon
+        "header_hint": pick_header_color(day),
         "avg": {
             "wave_m": round(day["avg_wave"], 2),
             "period_s": round(day["avg_per"], 1),
@@ -802,21 +813,6 @@ def _ai_coach(day, purpose="today"):
         },
         "diag": day.get("diag", {}),
         "hourly_compact": day.get("hourly_compact", []),
-        "dayparts": {
-            k: {
-                "color": v["color"],
-                "wave_min": round(v["h_min"], 2),
-                "wave_max": round(v["h_max"], 2),
-                "period_med": round(v["t_rep"], 1) if v.get("t_rep") is not None else None,
-                "period_band": [
-                    round(v["t_min"], 1) if v.get("t_min") is not None else None,
-                    round(v["t_max"], 1) if v.get("t_max") is not None else None,
-                ],
-                "wind_avg": round(v["wind_avg"], 1),
-                "wind_type": v["wind_type"],
-            }
-            for k, v in (day.get("dayparts") or {}).items()
-        },
         "window_phrase": natural_window_phrase(day),
     }
 
@@ -824,15 +820,14 @@ def _ai_coach(day, purpose="today"):
         instruction = (
             "Schrijf 1 korte, menselijke surfcoach-zin (10-18 woorden) voor morgen/overmorgen. "
             "Je mag 1-2 getallen noemen (hoogte/periode/wind), maar noem geen tijden. "
-            "Onderbouw met 2 signalen uit de data (windrichting-aandeel, periode-trend, windsterkte, stabiliteit, piek). "
-            "Pas je enthousiasme aan op stoplicht (groen blij, oranje genuanceerd, rood duidelijk). "
-            "Vermijd vage woorden zonder onderbouwing."
+            "Onderbouw met 2 signalen uit de data (windrichting, periode, windsterkte, stabiliteit). "
+            "Pas je enthousiasme aan op stoplicht (groen blij, oranje genuanceerd, rood duidelijk)."
         )
     else:
         instruction = (
             "Schrijf 1 korte, menselijke surfcoach-zin (10-20 woorden) voor vandaag. "
             "Je mag 1-2 getallen noemen (hoogte/periode/wind), maar noem geen tijden. "
-            "Onderbouw met 2 signalen uit de data (windrichting-aandeel, periode-trend, windsterkte, stabiliteit, piek). "
+            "Onderbouw met 2 signalen uit de data (windrichting, periode, windsterkte, stabiliteit). "
             "Als stoplicht groen is, mag je echt enthousiast zijn. "
             "Als stoplicht oranje is, mag je zeggen dat er heerlijke momenten of setjes tussenzitten, "
             "maar noem het geen heerlijk surfen. "
@@ -991,8 +986,8 @@ def send_telegram_message(text):
 # =======================
 if __name__ == "__main__":
     # Belangrijk:
-    # - Als je cron gebruikt: zet cron op 08:00 en laat onderstaande wait staan (wacht dan 0 sec).
-    # - Als je script continu draait: dit zorgt dat hij om 08:00 verstuurt.
+    # - Als je cron gebruikt: zet cron op 08:00 (Amsterdam). Dit is de echte fix voor 'drift'.
+    # - Als je script continu draait: dit zorgt dat hij om 08:00 (Amsterdam) verstuurt.
     wait_until_send_time(SEND_AT_HOUR, SEND_AT_MINUTE)
 
     try:
